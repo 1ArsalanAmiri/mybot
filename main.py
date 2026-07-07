@@ -15,10 +15,13 @@ from handlers import (
     receipt_handler,
     start,
     start_receipt_conversation,
+    admin_add_config,
+    admin_delete_config,
+    admin_list_keys,
+    admin_list_configs,
+    admin_help,
 )
 import logging
-from telegram.ext import CommandHandler
-from handlers import admin_add_config, admin_list_keys
 
 
 logging.basicConfig(
@@ -47,11 +50,13 @@ def main():
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("addconfig", admin_add_config))
+    app.add_handler(CommandHandler("delconfig", admin_delete_config))
     app.add_handler(CommandHandler("listkeys", admin_list_keys))
+    app.add_handler(CommandHandler("listconfigs", admin_list_configs))
+    app.add_handler(CommandHandler("adminhelp", admin_help))
     app.add_handler(receipt_conv_handler)
     app.add_handler(CallbackQueryHandler(button_handler))
-    app.add_handler(MessageHandler(filters.ALL, debug_get_chat_id))
-
+    app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, debug_get_chat_id))
 
     print("BOT STARTED WITH DATABASE...")
     app.run_polling()

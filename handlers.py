@@ -10,7 +10,9 @@ from db import (
     get_user_balance, get_or_create_user, has_used_test_account,
     get_available_config, get_user_orders,
     mark_test_account_used, assign_config_to_order,
-    create_order,add_config, count_available_configs, get_stock_summary,
+    create_order, add_config, count_available_configs, get_stock_summary,
+    delete_config, get_config_by_id, get_configs_by_product,
+    get_order_by_id, update_order_status,
 )
 from utils import (
     build_admin_order_text,
@@ -76,14 +78,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ---------------------------------------------------------------------------
 
 async def admin_add_config(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    استفاده:
-      /addconfig <product_key> <link>
-      /addconfig test_config <link>
 
-    مثال:
-      /addconfig buy_1m_10gb https://main.projectv2.blog:2086/sub/xxxx
-    """
     user = update.effective_user
     if not user or user.id != ADMIN_ID:
         return  # فقط ادمین اصلی
@@ -140,6 +135,107 @@ async def admin_list_keys(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
 
+async def admin_list_configs(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """نمایش لینک‌های موجود یک محصول به همراه شناسه، فقط برای ادمین."""
+    user = update.effective_user
+    if not user or user.id != ADMIN_ID:
+        return
+
+    args = context.args
+    if len(args) != 1:
+        await update.message.reply_text(
+            "❌ فرمت درست:\n"
+            "<code>/listconfigs product_key</code>\n\n"
+            "مثال:\n"
+            "<code>/listconfigs buy_1m_10gb</code>\n\n"
+            "برای دیدن لیست کلیدهای معتبر از /listkeys استفاده کن.",
+            parse_mode="HTML",
+        )
+        return
+
+    product_key = args[0].strip()
+    if product_key != "test_config" and product_key not in PRODUCTS:
+        await update.message.reply_text(
+            "⚠️ این product_key معتبر نیست.\n"
+            "برای دیدن لیست کلیدهای معتبر از دستور /listkeys استفاده کن."
+        )
+        return
+
+    configs = get_configs_by_product(product_key, limit=30)
+    if not configs:
+        await update.message.reply_text(
+            f"📦 در حال حاضر هیچ لینک موجودی برای <code>{escape(product_key)}</code> ثبت نشده.",
+            parse_mode="HTML",
+        )
+        return
+
+    lines = [f"📋 <b>لینک‌های موجود برای {escape(product_key)}:</b>\n"]
+    for cfg in configs:
+        link = cfg["link"]
+        short_link = link if len(link) <= 60 else link[:57] + "..."
+        lines.append(f"• شناسه <code>{cfg['id']}</code> → <code>{escape(short_link)}</code>")
+    lines.append("\n🗑 برای حذف یک لینک: <code>/delconfig شناسه</code>")
+
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+
+async def admin_delete_config(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """حذف یک لینک کانفیگ از انبار با شناسه، فقط برای ادمین."""
+    user = update.effective_user
+    if not user or user.id != ADMIN_ID:
+        return
+
+    args = context.args
+    if len(args) != 1 or not args[0].strip().lstrip("-").isdigit():
+        await update.message.reply_text(
+            "❌ فرمت درست:\n"
+            "<code>/delconfig config_id</code>\n\n"
+            "مثال:\n"
+            "<code>/delconfig 5</code>\n\n"
+            "برای دیدن شناسه‌های موجود از /listconfigs product_key استفاده کن.",
+            parse_mode="HTML",
+        )
+        return
+
+    config_id = int(args[0].strip())
+    config = get_config_by_id(config_id)
+    if not config:
+        await update.message.reply_text("⚠️ لینکی با این شناسه پیدا نشد.")
+        return
+
+    if config["status"] != "available":
+        await update.message.reply_text("⚠️ این لینک قبلاً فروخته شده و قابل حذف نیست.")
+        return
+
+    ok = delete_config(config_id)
+    if ok:
+        remaining = count_available_configs(config["product_key"])
+        await update.message.reply_text(
+            f"🗑 لینک با شناسه <code>{config_id}</code> از محصول <code>{escape(config['product_key'])}</code> حذف شد.\n"
+            f"📦 موجودی باقی‌مانده این محصول: {remaining} عدد",
+            parse_mode="HTML",
+        )
+    else:
+        await update.message.reply_text("❌ حذف انجام نشد. ممکن است قبلاً حذف یا فروخته شده باشد.")
+
+
+async def admin_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """راهنمای دستورات ادمین."""
+    user = update.effective_user
+    if not user or user.id != ADMIN_ID:
+        return
+
+    text = (
+        "🛠 <b>دستورات مدیریتی</b>\n\n"
+        "• <code>/addconfig product_key link</code>\n  افزودن یک لینک جدید به انبار\n\n"
+        "• <code>/delconfig config_id</code>\n  حذف یک لینک با شناسه (فقط اگر فروخته نشده باشد)\n\n"
+        "• <code>/listkeys</code>\n  نمایش همه‌ی کلیدهای محصولات و موجودی هرکدام\n\n"
+        "• <code>/listconfigs product_key</code>\n  نمایش لینک‌های موجود یک محصول به همراه شناسه\n\n"
+        "• <code>/adminhelp</code>\n  نمایش همین راهنما"
+    )
+    await update.message.reply_text(text, parse_mode="HTML")
+
+
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     if not query:
@@ -154,28 +250,40 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ------------------ بخش تأیید و رد فاکتور توسط ادمین ------------------
     if data.startswith("approve_order_"):
-        parts = data.split("_")
-        if len(parts) < 4:
+        try:
+            order_id = int(data.rsplit("_", 1)[-1])
+        except (ValueError, IndexError):
             await query.answer("خطای داخلی: شناسه سفارش نامعتبر است.", show_alert=True)
             return None
 
-        product_key = parts[2]
-        customer_id = int(parts[3])
-        order_id = None
-        if len(parts) == 5:
-            order_id = int(parts[4])
+        if not user or user.id != ADMIN_ID:
+            await query.answer("⛔️ فقط ادمین می‌تواند این کار را انجام دهد.", show_alert=True)
+            return None
+
+        order = get_order_by_id(order_id)
+        if not order:
+            await query.answer("❌ این سفارش پیدا نشد.", show_alert=True)
+            return None
+
+        if order["status"] == "completed":
+            await query.answer("ℹ️ این سفارش قبلاً تأیید و ارسال شده است.", show_alert=True)
+            return None
+
+        product_key = order["product_key"]
+        customer_id = order["user_id"]
 
         config_data = get_available_config(product_key)
-
         if not config_data:
-            await query.answer("❌ موجودی این محصول در دیتابیس تمام شده است! از /addconfig برای اضافه کردن لینک استفاده کن.", show_alert=True)
+            await query.answer(
+                "❌ موجودی این محصول در دیتابیس تمام شده است! از /addconfig برای اضافه کردن لینک استفاده کن.",
+                show_alert=True,
+            )
             return None
 
         config_link = config_data['link']
         config_id = config_data['id']
 
-        if order_id:
-            assign_config_to_order(order_id, config_id)
+        assign_config_to_order(order_id, config_id)
 
         product = PRODUCTS.get(product_key, {})
         size = product.get("size", "نامشخص")
@@ -199,7 +307,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     [InlineKeyboardButton("🏠 منوی اصلی", callback_data="main_menu")],
                 ]),
             )
-            await query.edit_message_caption(caption="✅ این فاکتور تأیید شد و لینک اشتراک برای کاربر ارسال گردید.")
+            try:
+                await query.edit_message_caption(caption="✅ این فاکتور تأیید شد و لینک اشتراک برای کاربر ارسال گردید.")
+            except TelegramError:
+                try:
+                    await query.edit_message_text("✅ این فاکتور تأیید شد و لینک اشتراک برای کاربر ارسال گردید.")
+                except TelegramError:
+                    pass
         except Exception as e:
             print(f"Error sending config to customer {customer_id}: {e}")
             await query.answer("❌ خطا در ارسال پیام به کاربر. ممکن است ربات را بلاک کرده باشد.", show_alert=True)
@@ -207,18 +321,40 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return None
 
     elif data.startswith("reject_order_"):
-        parts = data.split("_")
-        if len(parts) < 3:
-            await query.answer("خطای داخلی: شناسه کاربر نامعتبر است.", show_alert=True)
+        try:
+            order_id = int(data.rsplit("_", 1)[-1])
+        except (ValueError, IndexError):
+            await query.answer("خطای داخلی: شناسه سفارش نامعتبر است.", show_alert=True)
             return None
-        customer_id = int(parts[2])
+
+        if not user or user.id != ADMIN_ID:
+            await query.answer("⛔️ فقط ادمین می‌تواند این کار را انجام دهد.", show_alert=True)
+            return None
+
+        order = get_order_by_id(order_id)
+        if not order:
+            await query.answer("❌ این سفارش پیدا نشد.", show_alert=True)
+            return None
+
+        if order["status"] == "completed":
+            await query.answer("ℹ️ این سفارش قبلاً تأیید شده و دیگر قابل رد کردن نیست.", show_alert=True)
+            return None
+
+        customer_id = order["user_id"]
+        update_order_status(order_id, "failed")
 
         try:
             await context.bot.send_message(
                 chat_id=customer_id,
                 text="❌ رسید شما توسط مدیریت تأیید نشد. در صورت بروز مشکل با پشتیبانی در ارتباط باشید."
             )
-            await query.edit_message_caption(caption="❌ این فاکتور رد شد و به کاربر اطلاع داده شد.")
+            try:
+                await query.edit_message_caption(caption="❌ این فاکتور رد شد و به کاربر اطلاع داده شد.")
+            except TelegramError:
+                try:
+                    await query.edit_message_text("❌ این فاکتور رد شد و به کاربر اطلاع داده شد.")
+                except TelegramError:
+                    pass
         except TelegramError as e:
             print(f"Error notifying user {customer_id} about rejected order: {e}")
             await query.answer("❌ مشکلی در پردازش درخواست رد رخ داد.", show_alert=True)
@@ -526,31 +662,45 @@ async def receipt_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await message.reply_text("✅ رسید دریافت شد و برای بررسی ارسال شد.")
 
+    order_id_for_admin = order.get('order_id')
+    if not order_id_for_admin:
+        print("Warning: order_id not found in pending_order.")
+        await message.reply_text("خطای داخلی: سفارش معتبر پیدا نشد. لطفاً دوباره از منو خرید را انجام بده.")
+        return ConversationHandler.END
+
+    product_key_raw = str(order.get('product_key', '')).strip()
+    stock_count = count_available_configs(product_key_raw) if product_key_raw else 0
+
+    if stock_count > 0:
+        stock_status_line = f"📦 <b>وضعیت موجودی:</b> ✅ اشتراک موجود است ({stock_count} عدد)"
+        stock_status_caption = "✅ اشتراک موجود است"
+    else:
+        stock_status_line = (
+            "📦 <b>وضعیت موجودی:</b> ❌ موجودی اشتراک کافی نیست!\n"
+            "قبل از تأیید، با <code>/addconfig</code> لینک اضافه کن."
+        )
+        stock_status_caption = "❌ موجودی کافی نیست"
+
     admin_text = (
         "🚨 <b>رسید پرداخت جدید</b>\n\n"
         f"{user_details_text}\n"
         f"{order_details_text}\n"
+        f"{stock_status_line}\n\n"
         f"📎 <b>نوع ارسال:</b> <code>{file_kind}</code>\n\n"
         "برای تایید این رسید و شارژ حساب کاربر اقدام کنید."
     )
 
-    product_key = escape(order.get('product_key', 'محصول'))
-    admin_caption = f"رسید جدید پرداخت از کاربر {user.id} ({user_full_name})\nمحصول: {product_key}"
+    product_key = escape(product_key_raw or 'محصول')
+    admin_caption = (
+        f"رسید جدید پرداخت از کاربر {user.id} ({user_full_name})\n"
+        f"محصول: {product_key}\n"
+        f"{stock_status_caption}"
+    )
 
-    order_id_for_admin = order.get('order_id')
-    if not order_id_for_admin:
-        print("Warning: order_id not found in pending_order. Cannot create approve button with order_id.")
-        admin_keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("✅ تأیید و ارسال کانفیگ",
-                                  callback_data=f"approve_order_{product_key}_{user.id}")],
-            [InlineKeyboardButton("❌ رد فاکتور", callback_data=f"reject_order_{user.id}")]
-        ])
-    else:
-        admin_keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("✅ تأیید و ارسال کانفیگ",
-                                  callback_data=f"approve_order_{product_key}_{user.id}_{order_id_for_admin}")],
-            [InlineKeyboardButton("❌ رد فاکتور", callback_data=f"reject_order_{user.id}")]
-        ])
+    admin_keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ تأیید و ارسال کانفیگ", callback_data=f"approve_order_{order_id_for_admin}")],
+        [InlineKeyboardButton("❌ رد فاکتور", callback_data=f"reject_order_{order_id_for_admin}")]
+    ])
 
     try:
         if file_kind == "document-image":

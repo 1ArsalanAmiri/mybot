@@ -192,3 +192,55 @@ def delete_config(config_id: int) -> bool:
         c.execute("DELETE FROM configs WHERE id = ? AND status = 'available'", (config_id,))
         conn.commit()
         return c.rowcount > 0
+
+
+def get_config_by_id(config_id: int) -> Optional[dict]:
+    with sqlite3.connect(DB_PATH) as conn:
+        c = conn.cursor()
+        c.execute("SELECT id, product_key, link, status FROM configs WHERE id = ?", (config_id,))
+        row = c.fetchone()
+        if not row:
+            return None
+        return {"id": row[0], "product_key": row[1], "link": row[2], "status": row[3]}
+
+
+def get_configs_by_product(product_key: str, limit: int = 30) -> List[dict]:
+    with sqlite3.connect(DB_PATH) as conn:
+        c = conn.cursor()
+        c.execute(
+            "SELECT id, link FROM configs WHERE product_key = ? AND status = 'available' ORDER BY id ASC LIMIT ?",
+            (product_key, limit)
+        )
+        return [{"id": r[0], "link": r[1]} for r in c.fetchall()]
+
+
+# ---------------------------------------------------------------------------
+# توابع جدید: مدیریت سفارشات (برای تایید/رد امن بدون وابستگی به پارس کردن رشته)
+# ---------------------------------------------------------------------------
+
+def get_order_by_id(order_id: int) -> Optional[dict]:
+    with sqlite3.connect(DB_PATH) as conn:
+        c = conn.cursor()
+        c.execute(
+            "SELECT id, user_id, product_key, price, status, assigned_config_id, order_date FROM orders WHERE id = ?",
+            (order_id,)
+        )
+        row = c.fetchone()
+        if not row:
+            return None
+        return {
+            "id": row[0],
+            "user_id": row[1],
+            "product_key": row[2],
+            "price": row[3],
+            "status": row[4],
+            "assigned_config_id": row[5],
+            "order_date": row[6],
+        }
+
+
+def update_order_status(order_id: int, status: str) -> None:
+    with sqlite3.connect(DB_PATH) as conn:
+        c = conn.cursor()
+        c.execute("UPDATE orders SET status = ? WHERE id = ?", (status, order_id))
+        conn.commit()
