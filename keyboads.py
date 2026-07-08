@@ -56,7 +56,7 @@ def get_main_menu_keyboard() -> InlineKeyboardMarkup:
             InlineKeyboardButton("🗂 کیف پول و حساب کاربری", callback_data="wallet_profile"),
         ],
         [
-            InlineKeyboardButton("🎁 هدیه", callback_data="gift"),
+            InlineKeyboardButton("📢 کانال ما", url="https://t.me/ArsalanVPN_channel"),
             InlineKeyboardButton("📚 آموزش اتصال", callback_data="tutorial"),
         ],
         [
@@ -118,10 +118,7 @@ def get_support_keyboard() -> InlineKeyboardMarkup:
 
 def get_wallet_keyboard() -> InlineKeyboardMarkup:
     keyboard = [
-        [
-            InlineKeyboardButton("💳 افزایش موجودی", callback_data="add_balance"),
-            InlineKeyboardButton("🎟 کد تخفیف", callback_data="discount_code"),
-        ],
+        [InlineKeyboardButton("💳 افزایش موجودی", callback_data="add_balance")],
         [InlineKeyboardButton("🔙 بازگشت به منوی اصلی", callback_data="main_menu")]
     ]
     return InlineKeyboardMarkup(keyboard)

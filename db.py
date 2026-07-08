@@ -244,3 +244,17 @@ def update_order_status(order_id: int, status: str) -> None:
         c = conn.cursor()
         c.execute("UPDATE orders SET status = ? WHERE id = ?", (status, order_id))
         conn.commit()
+
+
+def add_user_balance(user_id: int, amount: int) -> None:
+    with sqlite3.connect(DB_PATH) as conn:
+        c = conn.cursor()
+        c.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (amount, user_id))
+        conn.commit()
+
+
+def mark_config_sold(config_id: int) -> None:
+    with sqlite3.connect(DB_PATH) as conn:
+        c = conn.cursor()
+        c.execute("UPDATE configs SET status = 'sold' WHERE id = ?", (config_id,))
+        conn.commit()

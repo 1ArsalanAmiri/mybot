@@ -1,11 +1,11 @@
 from html import escape
 
 import jdatetime
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, LabeledPrice
 from telegram.ext import ContextTypes, ConversationHandler
 from telegram.error import BadRequest, TelegramError
 
-from config import ADMIN_ID, CHANNEL_ID, TRANSACTION_LOG_CHANNEL_ID
+from config import ADMIN_ID, CHANNEL_ID, TRANSACTION_LOG_CHANNEL_ID, TOMAN_PER_STAR
 from db import (
     get_user_balance, get_or_create_user, has_used_test_account,
     get_available_config, get_user_orders,
@@ -13,9 +13,9 @@ from db import (
     create_order, add_config, count_available_configs, get_stock_summary,
     delete_config, get_config_by_id, get_configs_by_product,
     get_order_by_id, update_order_status,
+    add_user_balance, mark_config_sold,
 )
 from utils import (
-    build_admin_order_text,
     build_order_text,
     build_service_delivered_text,
     delete_message_safe,
@@ -23,15 +23,28 @@ from utils import (
     get_safe_username,
     send_new_message,
     format_toman,
-    generate_qr_code,
 )
 import os
 from keyboads import get_main_menu_keyboard, get_wallet_keyboard, get_support_keyboard, get_products_keyboard, \
     DURATION_CODE_TO_DAYS, get_duration_menu_keyboard, get_payment_method_keyboard, PRODUCTS
 
 WAITING_FOR_RECEIPT = 1
-users_seen_join = set()
+WAITING_FOR_TOPUP_AMOUNT = 2
 ALLOWED_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
+
+BAD_WORDS = {
+    "کیری", "کصکش", "کسکش", "کوسکش", "جاکش", "کونی", "کیرم", "کص", "کس",
+    "لاشی", "عوضی", "احمق", "خارکسه", "مادرجنده", "ننه جنده", "جنده",
+    "حرومزاده", "بی شرف", "بیشرف", "آشغال", "کثافت", "گوه", "خفه شو",
+    "کیرخر", "مادرقحبه", "ننه سگ", "پدرسگ", "عنتر", "خری", "الاغ",
+}
+
+
+def contains_profanity(text: str) -> bool:
+    if not text:
+        return False
+    normalized = text.replace("‌", " ").lower()
+    return any(bad in normalized for bad in BAD_WORDS)
 
 
 async def check_user_membership(user_id: int, bot) -> bool:
@@ -73,15 +86,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-# ---------------------------------------------------------------------------
-# دستورات مخصوص ادمین: اضافه کردن لینک کانفیگ/ساب به انبار
-# ---------------------------------------------------------------------------
-
 async def admin_add_config(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
     user = update.effective_user
     if not user or user.id != ADMIN_ID:
-        return  # فقط ادمین اصلی
+        return
 
     args = context.args
     if len(args) < 2:
@@ -117,7 +125,6 @@ async def admin_add_config(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def admin_list_keys(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """لیست کلیدهای معتبر محصولات + موجودی فعلی هرکدام، فقط برای ادمین."""
     user = update.effective_user
     if not user or user.id != ADMIN_ID:
         return
@@ -136,7 +143,6 @@ async def admin_list_keys(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def admin_list_configs(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """نمایش لینک‌های موجود یک محصول به همراه شناسه، فقط برای ادمین."""
     user = update.effective_user
     if not user or user.id != ADMIN_ID:
         return
@@ -180,7 +186,6 @@ async def admin_list_configs(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 async def admin_delete_config(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """حذف یک لینک کانفیگ از انبار با شناسه، فقط برای ادمین."""
     user = update.effective_user
     if not user or user.id != ADMIN_ID:
         return
@@ -220,7 +225,6 @@ async def admin_delete_config(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 async def admin_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """راهنمای دستورات ادمین."""
     user = update.effective_user
     if not user or user.id != ADMIN_ID:
         return
@@ -236,6 +240,49 @@ async def admin_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text, parse_mode="HTML")
 
 
+async def _deliver_topup(order: dict, context: ContextTypes.DEFAULT_TYPE):
+    customer_id = order["user_id"]
+    amount = order["price"]
+    add_user_balance(customer_id, amount)
+    update_order_status(order["id"], "completed")
+    await context.bot.send_message(
+        chat_id=customer_id,
+        text=f"✅ پرداخت شما تأیید شد و مبلغ {format_toman(amount)} تومان به کیف پول شما اضافه شد.",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 منوی اصلی", callback_data="main_menu")]]),
+    )
+
+
+async def _deliver_product(order: dict, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    product_key = order["product_key"]
+    customer_id = order["user_id"]
+
+    config_data = get_available_config(product_key)
+    if not config_data:
+        return False
+
+    assign_config_to_order(order["id"], config_data["id"])
+
+    product = PRODUCTS.get(product_key, {})
+    size = product.get("size", "نامشخص")
+    duration_days = product.get("duration", "نامشخص")
+
+    success_text = build_service_delivered_text(
+        user_id=customer_id,
+        config_id=config_data["id"],
+        size=size,
+        duration_days=duration_days,
+        link=config_data["link"],
+    )
+
+    await context.bot.send_message(
+        chat_id=customer_id,
+        text=success_text,
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 منوی اصلی", callback_data="main_menu")]]),
+    )
+    return True
+
+
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     if not query:
@@ -248,7 +295,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     full_name = " ".join(filter(None, [user.first_name, user.last_name])).strip() or "کاربر"
     db_user = get_or_create_user(user_id, user.username, full_name)
 
-    # ------------------ بخش تأیید و رد فاکتور توسط ادمین ------------------
     if data.startswith("approve_order_"):
         try:
             order_id = int(data.rsplit("_", 1)[-1])
@@ -269,54 +315,44 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.answer("ℹ️ این سفارش قبلاً تأیید و ارسال شده است.", show_alert=True)
             return None
 
-        product_key = order["product_key"]
         customer_id = order["user_id"]
 
-        config_data = get_available_config(product_key)
-        if not config_data:
+        if order["product_key"] == "topup":
+            try:
+                await _deliver_topup(order, context)
+                try:
+                    await query.edit_message_caption(caption="✅ این درخواست افزایش موجودی تأیید و اعمال شد.")
+                except TelegramError:
+                    try:
+                        await query.edit_message_text("✅ این درخواست افزایش موجودی تأیید و اعمال شد.")
+                    except TelegramError:
+                        pass
+            except Exception as e:
+                print(f"Error delivering topup to {customer_id}: {e}")
+                await query.answer("❌ خطا در اطلاع‌رسانی به کاربر.", show_alert=True)
+            return None
+
+        try:
+            delivered = await _deliver_product(order, context)
+        except Exception as e:
+            print(f"Error sending config to customer {customer_id}: {e}")
+            await query.answer("❌ خطا در ارسال پیام به کاربر. ممکن است ربات را بلاک کرده باشد.", show_alert=True)
+            return None
+
+        if not delivered:
             await query.answer(
                 "❌ موجودی این محصول در دیتابیس تمام شده است! از /addconfig برای اضافه کردن لینک استفاده کن.",
                 show_alert=True,
             )
             return None
 
-        config_link = config_data['link']
-        config_id = config_data['id']
-
-        assign_config_to_order(order_id, config_id)
-
-        product = PRODUCTS.get(product_key, {})
-        size = product.get("size", "نامشخص")
-        duration_days = product.get("duration", "نامشخص")
-
-        success_text = build_service_delivered_text(
-            user_id=customer_id,
-            config_id=config_id,
-            size=size,
-            duration_days=duration_days,
-            link=config_link,
-        )
-
         try:
-            await context.bot.send_message(
-                chat_id=customer_id,
-                text=success_text,
-                parse_mode="HTML",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("📚 آموزش اتصال", callback_data="tutorial")],
-                    [InlineKeyboardButton("🏠 منوی اصلی", callback_data="main_menu")],
-                ]),
-            )
+            await query.edit_message_caption(caption="✅ این فاکتور تأیید شد و لینک اشتراک برای کاربر ارسال گردید.")
+        except TelegramError:
             try:
-                await query.edit_message_caption(caption="✅ این فاکتور تأیید شد و لینک اشتراک برای کاربر ارسال گردید.")
+                await query.edit_message_text("✅ این فاکتور تأیید شد و لینک اشتراک برای کاربر ارسال گردید.")
             except TelegramError:
-                try:
-                    await query.edit_message_text("✅ این فاکتور تأیید شد و لینک اشتراک برای کاربر ارسال گردید.")
-                except TelegramError:
-                    pass
-        except Exception as e:
-            print(f"Error sending config to customer {customer_id}: {e}")
-            await query.answer("❌ خطا در ارسال پیام به کاربر. ممکن است ربات را بلاک کرده باشد.", show_alert=True)
+                pass
 
         return None
 
@@ -361,7 +397,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         return None
 
-    # ------------------ بخش اکانت تست ------------------
     elif data == "test_account":
         if has_used_test_account(user_id):
             await query.answer("شما قبلاً از سرویس تست استفاده کرده‌اید ❌", show_alert=True)
@@ -378,26 +413,24 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return None
 
         mark_test_account_used(user_id)
+        mark_config_sold(test_config["id"])
 
         text = (
             "✅ سرویس تست با موفقیت ایجاد شد\n\n"
             f"👤 نام کاربری سرویس : {user_id}_test\n"
             "🌿 نام سرویس: تست\n"
-            "🇺🇳 لوکیشن: projectv\n"
+            "🇺🇳 لوکیشن: Netherlands\n"
             "⏳ مدت زمان: 100 ساعت\n"
-            "🗜 حجم سرویس: 256 مگابایت\n\n"
+            f"🗜 حجم سرویس: {test_config.get('size', '256 مگابایت')}\n\n"
             "لینک اتصال:\n"
-            f"<code>{test_config['link']}</code>\n\n"
-            "🧑‍🦯 شما میتوانید شیوه اتصال را با فشردن دکمه زیر دریافت کنید."
+            f"<code>{test_config['link']}</code>"
         )
         await delete_message_safe(query)
         await send_new_message(update, context, text=text, reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("آموزش اتصال", callback_data="tutorial")],
             [InlineKeyboardButton("🏠 منوی اصلی", callback_data="main_menu")]
         ]))
         return None
 
-    # ------------------ بخش سرویس‌های من ------------------
     elif data == "my_services":
         orders = get_user_orders(user_id)
         text = "🛍 <b>اشتراک های خریداری شده توسط شما</b>\n\n⚠️ برای مشاهده اطلاعات و مدیریت روی نام کاربری کلیک کنید."
@@ -416,22 +449,21 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await send_new_message(update, context, text=text, reply_markup=InlineKeyboardMarkup(buttons))
         return None
 
-    # ------------------ بخش حساب کاربری ------------------
     elif data == "wallet_profile":
         orders_count = len(get_user_orders(user_id))
         now = jdatetime.datetime.now().strftime("%Y/%m/%d → ⏰ %H:%M:%S")
 
         text = (
             "🗂 <b>اطلاعات حساب کاربری شما :</b>\n\n"
-            f"🪪 شناسه کاربری: <code>{user_id}</code>\n"
-            f"👤 نام: {escape(full_name)}\n"
-            f"👥 کد معرف شما : <code>{db_user['referral_code']}</code>\n"
-            f"📱 شماره تماس : {db_user.get('phone', 'ثبت نشده')}\n"
-            f"⌚️زمان ثبت نام : {db_user['join_date']}\n"
-            f"💰 موجودی: {format_toman(db_user['balance'])} تومان\n"
-            f"🛒 تعداد سرویس های خریداری شده : {orders_count} عدد\n"
-            f"📑 تعداد فاکتور های پرداخت شده : {orders_count} عدد\n"
-            f"🤝 تعداد زیر مجموعه های شما : 0 نفر\n"
+            f"🪪 شناسه کاربری: <code>{user_id}</code>\n\n"
+            f"👤 نام: {escape(full_name)}\n\n"
+            f"👥 کد معرف شما : <code>{db_user['referral_code']}</code>\n\n"
+            f"📱 شماره تماس : {db_user.get('phone', 'ثبت نشده')}\n\n"
+            f"⌚️ زمان ثبت نام : {db_user['join_date']}\n\n"
+            f"💰 موجودی: {format_toman(db_user['balance'])} تومان\n\n"
+            f"🛒 تعداد سرویس های خریداری شده : {orders_count} عدد\n\n"
+            f"📑 تعداد فاکتور های پرداخت شده : {orders_count} عدد\n\n"
+            f"🤝 تعداد زیر مجموعه های شما : 0 نفر\n\n"
             "🔖 گروه کاربری : عادی\n\n"
             f"📆 {now}"
         )
@@ -439,7 +471,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await send_new_message(update, context, text=text, reply_markup=get_wallet_keyboard())
         return None
 
-    # ------------------ بخش پشتیبانی و سوالات ------------------
     elif data == "support":
         text = "☎️ در دکمه زیر ( سوالات متداول ) سوالات پرتکرار شما آمده است. روی دکمه زیر کلیک کنید در صورت نیافتن سوال خود روی دکمه پشتیبانی کلیک کنید"
         await delete_message_safe(query)
@@ -462,7 +493,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [[InlineKeyboardButton("🔙 بازگشت به منوی اصلی", callback_data="main_menu")]]))
         return None
 
-    # -------------- مدیریت دکمه خرید کانفیگ --------------
+    elif data == "tutorial":
+        joke_text = "همین الان یا با پروکسی وصلی یا با وی پی ان ،دنبال آموزش اتصال چی میگردی دیگه یابو؟ 😂😂😂😂😂😂😂😂😂😂😂"
+        await delete_message_safe(query)
+        await send_new_message(update, context, text=joke_text, reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("🏠 منوی اصلی", callback_data="main_menu")]]))
+        return None
+
     elif data == "buy_config":
         await delete_message_safe(query)
         await send_new_message(
@@ -472,7 +509,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return None
 
-    # -------------- مدیریت دکمه انتخاب مدت زمان --------------
     elif data in DURATION_CODE_TO_DAYS:
         duration_days = DURATION_CODE_TO_DAYS[data]
         await delete_message_safe(query)
@@ -483,8 +519,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return None
 
-    # -------------- مدیریت انتخاب یک پلن مشخص (مثلاً buy_1m_10gb) --------------
-    # 👈 این بخش قبلاً وجود نداشت و دلیل اصلی کار نکردن دکمه‌ها بود
     elif data in PRODUCTS:
         product = PRODUCTS[data]
         size = product["size"]
@@ -494,6 +528,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         order_id = create_order(user_id, data, price)
 
         context.user_data["pending_order"] = {
+            "type": "product",
             "product_key": data,
             "service_title": f"{size} / {duration_days} روزه",
             "duration_days": duration_days,
@@ -519,7 +554,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return None
 
-    # -------------- مدیریت دکمه بازگشت به منوی اصلی --------------
     elif data == "main_menu":
         await delete_message_safe(query)
         await send_new_message(
@@ -529,7 +563,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return None
 
-    # -------------- مدیریت دکمه های پرداخت (مثلا pay_card) --------------
     elif data == "pay_card":
         order_data = context.user_data.get("pending_order")
         if not order_data:
@@ -572,6 +605,41 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return None
 
+    elif data == "pay_stars":
+        order_data = context.user_data.get("pending_order")
+        if not order_data:
+            await query.answer("خطا: سفارش فعالی یافت نشد. لطفاً مجدداً تلاش کنید.", show_alert=True)
+            return None
+
+        price_toman_int = order_data.get('price_toman')
+        order_id = order_data.get('order_id')
+        if not price_toman_int or not order_id:
+            await query.answer("خطا: اطلاعات سفارش نامعتبر است.", show_alert=True)
+            return None
+
+        stars_amount = max(1, round(int(price_toman_int) / TOMAN_PER_STAR))
+        title = str(order_data.get('service_title') or 'خرید از ربات')[:32]
+
+        try:
+            await delete_message_safe(query)
+            await context.bot.send_invoice(
+                chat_id=update.effective_chat.id,
+                title=title,
+                description=f"{title} - پرداخت با Telegram Stars",
+                payload=f"order_{order_id}",
+                provider_token="",
+                currency="XTR",
+                prices=[LabeledPrice(title, stars_amount)],
+            )
+        except TelegramError as e:
+            print(f"Error sending stars invoice: {e}")
+            await send_new_message(
+                update, context,
+                text="❌ خطا در ایجاد فاکتور Telegram Stars. لطفاً بعداً دوباره امتحان کن یا از روش کارت به کارت استفاده کن.",
+                reply_markup=get_payment_method_keyboard(),
+            )
+        return None
+
     return None
 
 
@@ -591,7 +659,73 @@ async def start_receipt_conversation(update: Update, context: ContextTypes.DEFAU
     return WAITING_FOR_RECEIPT
 
 
+async def start_topup_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query:
+        return ConversationHandler.END
+
+    await query.answer()
+    await delete_message_safe(query)
+
+    await send_new_message(
+        update,
+        context,
+        text="💸 مبلغ را به تومان وارد کنید:\n⚠️ حداقل مبلغ 50,000 حداکثر مبلغ 5,000,000 تومان می باشد",
+    )
+    return WAITING_FOR_TOPUP_AMOUNT
+
+
+async def topup_amount_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.effective_message
+    user = update.effective_user
+
+    if not message or not message.text:
+        await message.reply_text("❌ لطفاً فقط عدد به تومان ارسال کن.")
+        return WAITING_FOR_TOPUP_AMOUNT
+
+    if contains_profanity(message.text):
+        await message.reply_text("خودتی 🖕")
+        return WAITING_FOR_TOPUP_AMOUNT
+
+    raw = message.text.strip().replace(",", "").replace("،", "").replace(" ", "")
+    if not raw.isdigit():
+        await message.reply_text(
+            "❌ مقدار وارد شده معتبر نیست، فقط عدد به تومان بفرست.\n"
+            "⚠️ حداقل مبلغ 50,000 و حداکثر مبلغ 5,000,000 تومان می‌باشد."
+        )
+        return WAITING_FOR_TOPUP_AMOUNT
+
+    amount = int(raw)
+    if amount < 50000 or amount > 5000000:
+        await message.reply_text(
+            "❌ مبلغ باید بین 50,000 تا 5,000,000 تومان باشد. دوباره امتحان کن."
+        )
+        return WAITING_FOR_TOPUP_AMOUNT
+
+    order_id = create_order(user.id, "topup", amount)
+    context.user_data["pending_order"] = {
+        "type": "topup",
+        "product_key": "topup",
+        "service_title": "افزایش موجودی کیف پول",
+        "duration_days": "-",
+        "size": "-",
+        "price_toman": amount,
+        "order_id": order_id,
+    }
+
+    await message.reply_text(
+        f"💰 مبلغ {format_toman(amount)} تومان ثبت شد.\n\n💳 لطفاً روش پرداخت رو انتخاب کن:",
+        reply_markup=get_payment_method_keyboard(),
+    )
+    return ConversationHandler.END
+
+
 async def debug_get_chat_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.effective_message
+    if message and message.text and contains_profanity(message.text):
+        await message.reply_text("خودتی 🖕")
+        return
+
     chat = update.effective_chat
     if not chat:
         return
@@ -640,6 +774,8 @@ async def receipt_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await message.reply_text("سفارش پیدا نشد. لطفاً دوباره از اول خرید را انجام بده.")
         return ConversationHandler.END
 
+    is_topup = order.get('type') == 'topup'
+
     username_text = get_safe_username(user)
     user_full_name = " ".join(filter(None, [user.first_name, user.last_name])).strip() or "نامشخص"
 
@@ -651,14 +787,20 @@ async def receipt_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"• Chat ID: <code>{update.effective_chat.id if update.effective_chat else 'نامشخص'}</code>\n"
     )
 
-    order_details_text = (
-        "🛍 <b>مشخصات خرید</b>\n\n"
-        f"• سرویس: <b>{escape(str(order.get('service_title', 'نامشخص')))}</b>\n"
-        f"• مدت: <b>{escape(str(order.get('duration_days', 'نامشخص')))} روز</b>\n"
-        f"• حجم: <b>{escape(str(order.get('size', 'نامشخص')))}</b>\n"
-        f"• مبلغ: <b>{format_toman(order.get('price_toman', 'نامشخص'))} تومان</b>\n"
-        f"• کد محصول: <code>{escape(str(order.get('product_key', 'نامشخص')))}</code>\n"
-    )
+    if is_topup:
+        order_details_text = (
+            "💳 <b>درخواست افزایش موجودی</b>\n\n"
+            f"• مبلغ: <b>{format_toman(order.get('price_toman', 'نامشخص'))} تومان</b>\n"
+        )
+    else:
+        order_details_text = (
+            "🛍 <b>مشخصات خرید</b>\n\n"
+            f"• سرویس: <b>{escape(str(order.get('service_title', 'نامشخص')))}</b>\n"
+            f"• مدت: <b>{escape(str(order.get('duration_days', 'نامشخص')))} روز</b>\n"
+            f"• حجم: <b>{escape(str(order.get('size', 'نامشخص')))}</b>\n"
+            f"• مبلغ: <b>{format_toman(order.get('price_toman', 'نامشخص'))} تومان</b>\n"
+            f"• کد محصول: <code>{escape(str(order.get('product_key', 'نامشخص')))}</code>\n"
+        )
 
     await message.reply_text("✅ رسید دریافت شد و برای بررسی ارسال شد.")
 
@@ -669,17 +811,21 @@ async def receipt_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     product_key_raw = str(order.get('product_key', '')).strip()
-    stock_count = count_available_configs(product_key_raw) if product_key_raw else 0
 
-    if stock_count > 0:
-        stock_status_line = f"📦 <b>وضعیت موجودی:</b> ✅ اشتراک موجود است ({stock_count} عدد)"
-        stock_status_caption = "✅ اشتراک موجود است"
+    if is_topup:
+        stock_status_line = "💳 <b>نوع درخواست:</b> افزایش موجودی کیف پول"
+        stock_status_caption = "افزایش موجودی"
     else:
-        stock_status_line = (
-            "📦 <b>وضعیت موجودی:</b> ❌ موجودی اشتراک کافی نیست!\n"
-            "قبل از تأیید، با <code>/addconfig</code> لینک اضافه کن."
-        )
-        stock_status_caption = "❌ موجودی کافی نیست"
+        stock_count = count_available_configs(product_key_raw) if product_key_raw else 0
+        if stock_count > 0:
+            stock_status_line = f"📦 <b>وضعیت موجودی:</b> ✅ اشتراک موجود است ({stock_count} عدد)"
+            stock_status_caption = "✅ اشتراک موجود است"
+        else:
+            stock_status_line = (
+                "📦 <b>وضعیت موجودی:</b> ❌ موجودی اشتراک کافی نیست!\n"
+                "قبل از تأیید، با <code>/addconfig</code> لینک اضافه کن."
+            )
+            stock_status_caption = "❌ موجودی کافی نیست"
 
     admin_text = (
         "🚨 <b>رسید پرداخت جدید</b>\n\n"
@@ -687,18 +833,18 @@ async def receipt_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"{order_details_text}\n"
         f"{stock_status_line}\n\n"
         f"📎 <b>نوع ارسال:</b> <code>{file_kind}</code>\n\n"
-        "برای تایید این رسید و شارژ حساب کاربر اقدام کنید."
+        "برای تایید این رسید اقدام کنید."
     )
 
     product_key = escape(product_key_raw or 'محصول')
     admin_caption = (
         f"رسید جدید پرداخت از کاربر {user.id} ({user_full_name})\n"
-        f"محصول: {product_key}\n"
+        f"{'درخواست افزایش موجودی' if is_topup else f'محصول: {product_key}'}\n"
         f"{stock_status_caption}"
     )
 
     admin_keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ تأیید و ارسال کانفیگ", callback_data=f"approve_order_{order_id_for_admin}")],
+        [InlineKeyboardButton("✅ تأیید", callback_data=f"approve_order_{order_id_for_admin}")],
         [InlineKeyboardButton("❌ رد فاکتور", callback_data=f"reject_order_{order_id_for_admin}")]
     ])
 
@@ -761,3 +907,68 @@ async def receipt_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             print(f"An unexpected error occurred while sending to log channel: {e}")
 
     return ConversationHandler.END
+
+
+async def precheckout_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.pre_checkout_query
+    payload = query.invoice_payload or ""
+
+    if not payload.startswith("order_"):
+        await query.answer(ok=False, error_message="سفارش نامعتبر است.")
+        return
+
+    try:
+        order_id = int(payload.split("_", 1)[1])
+    except (ValueError, IndexError):
+        await query.answer(ok=False, error_message="سفارش نامعتبر است.")
+        return
+
+    order = get_order_by_id(order_id)
+    if not order or order["status"] == "completed":
+        await query.answer(ok=False, error_message="این سفارش دیگر معتبر نیست.")
+        return
+
+    await query.answer(ok=True)
+
+
+async def successful_payment_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.effective_message
+    payment = message.successful_payment if message else None
+    if not payment:
+        return
+
+    payload = payment.invoice_payload or ""
+    if not payload.startswith("order_"):
+        return
+
+    try:
+        order_id = int(payload.split("_", 1)[1])
+    except (ValueError, IndexError):
+        return
+
+    order = get_order_by_id(order_id)
+    if not order or order["status"] == "completed":
+        return
+
+    if order["product_key"] == "topup":
+        await _deliver_topup(order, context)
+        return
+
+    delivered = await _deliver_product(order, context)
+    if not delivered:
+        update_order_status(order_id, "pending")
+        await context.bot.send_message(
+            chat_id=order["user_id"],
+            text="✅ پرداخت شما با موفقیت دریافت شد، ولی موجودی این سرویس موقتاً تمام شده. به‌محض شارژ موجودی، لینک اشتراک برایتان ارسال می‌شود.",
+        )
+        try:
+            await context.bot.send_message(
+                chat_id=ADMIN_ID,
+                text=(
+                    f"⚠️ سفارش <code>{order_id}</code> با Telegram Stars پرداخت شد ولی موجودی محصول "
+                    f"<code>{escape(order['product_key'])}</code> تمام شده. لطفاً موجودی را اضافه و دستی برای کاربر ارسال کن."
+                ),
+                parse_mode="HTML",
+            )
+        except TelegramError:
+            pass

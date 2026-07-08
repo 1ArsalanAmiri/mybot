@@ -4,17 +4,23 @@ from telegram.ext import (
     CommandHandler,
     ConversationHandler,
     MessageHandler,
+    PreCheckoutQueryHandler,
     filters,
 )
 from config import BOT_TOKEN
 from db import init_db
 from handlers import (
     WAITING_FOR_RECEIPT,
+    WAITING_FOR_TOPUP_AMOUNT,
     button_handler,
     debug_get_chat_id,
     receipt_handler,
     start,
     start_receipt_conversation,
+    start_topup_conversation,
+    topup_amount_handler,
+    precheckout_handler,
+    successful_payment_handler,
     admin_add_config,
     admin_delete_config,
     admin_list_keys,
@@ -48,6 +54,18 @@ def main():
         fallbacks=[CommandHandler("start", start)],
     )
 
+    topup_conv_handler = ConversationHandler(
+        entry_points=[
+            CallbackQueryHandler(start_topup_conversation, pattern="^add_balance$")
+        ],
+        states={
+            WAITING_FOR_TOPUP_AMOUNT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, topup_amount_handler),
+            ],
+        },
+        fallbacks=[CommandHandler("start", start)],
+    )
+
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("addconfig", admin_add_config))
     app.add_handler(CommandHandler("delconfig", admin_delete_config))
@@ -55,7 +73,10 @@ def main():
     app.add_handler(CommandHandler("listconfigs", admin_list_configs))
     app.add_handler(CommandHandler("adminhelp", admin_help))
     app.add_handler(receipt_conv_handler)
+    app.add_handler(topup_conv_handler)
     app.add_handler(CallbackQueryHandler(button_handler))
+    app.add_handler(PreCheckoutQueryHandler(precheckout_handler))
+    app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_handler))
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, debug_get_chat_id))
 
     print("BOT STARTED WITH DATABASE...")
