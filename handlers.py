@@ -425,7 +425,19 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data == "test_account":
         if has_used_test_account(user_id):
-            await query.answer("شما قبلاً از سرویس تست استفاده کرده‌اید ❌", show_alert=True)
+            await delete_message_safe(query)
+            await send_new_message(
+                update, context,
+                text=(
+                    "⛔️ <b>شما قبلاً از اکانت تست استفاده کرده‌اید!</b>\n\n"
+                    "هر کاربر فقط یک‌بار می‌تونه از سرویس تست رایگان استفاده کنه 🙏\n"
+                    "برای ادامه، می‌تونی یکی از پلن‌های اصلی رو با بهترین قیمت تهیه کنی 👇"
+                ),
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🛒 خرید کانفیگ", callback_data="buy_config")],
+                    [InlineKeyboardButton("🏠 منوی اصلی", callback_data="main_menu")],
+                ])
+            )
             return None
 
         test_config = get_available_config("test_config")
@@ -442,17 +454,21 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         mark_config_sold(test_config["id"])
 
         text = (
-            "✅ سرویس تست با موفقیت ایجاد شد\n\n"
-            f"👤 نام کاربری سرویس : {user_id}_test\n"
-            "🌿 نام سرویس: تست\n"
-            "🇺🇳 لوکیشن: Netherlands\n"
-            "⏳ مدت زمان: 100 ساعت\n"
-            f"🗜 حجم سرویس: {test_config.get('size', '256 مگابایت')}\n\n"
-            "لینک اتصال:\n"
-            f"<code>{test_config['link']}</code>"
+            "🎁 <b>سرویس تست شما با موفقیت فعال شد!</b>\n"
+            "━━━━━━━━━━━━━━━\n"
+            f"👤 <b>نام کاربری سرویس:</b> <code>{user_id}_test</code>\n"
+            "🌿 <b>نوع سرویس:</b> تست رایگان\n"
+            "🇳🇱 <b>لوکیشن:</b> Netherlands\n"
+            "⏳ <b>مدت اعتبار:</b> 24 ساعت\n"
+            "🗜 <b>حجم سرویس:</b> 100 مگابایت\n"
+            "━━━━━━━━━━━━━━━\n\n"
+            "🔗 <b>لینک اتصال:</b>\n"
+            f"<code>{test_config['link']}</code>\n\n"
+            "💡 برای اتصال روی لینک بالا بزن تا کپی بشه، بعد طبق آموزش زیر وصل شو."
         )
         await delete_message_safe(query)
         await send_new_message(update, context, text=text, reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("📚 آموزش اتصال", callback_data="tutorial")],
             [InlineKeyboardButton("🏠 منوی اصلی", callback_data="main_menu")]
         ]))
         return None
