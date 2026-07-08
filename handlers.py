@@ -61,10 +61,19 @@ async def check_user_membership(user_id: int, bot) -> bool:
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if CHANNEL_ID and not await check_user_membership(user.id, context.bot):
+        channel_url = f"https://t.me/{CHANNEL_ID.replace('@', '')}"
+        join_text = (
+            "🔒 <b>یه قدم تا استفاده از ربات فاصله داری!</b>\n\n"
+            "برای اینکه بتونی از امکانات ربات استفاده کنی، اول باید توی کانال ما عضو بشی. "
+            "بعد از عضویت، دوباره دستور /start رو بزن تا وارد ربات بشی. ✅"
+        )
         await update.message.reply_text(
-            "برای استفاده از ربات، ابتدا در کانال ما عضو شوید:\n"
-            f"[کانال ما](https://t.me/{CHANNEL_ID.replace('@', '')})",
-            parse_mode="Markdown"
+            text=join_text,
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("📢 عضویت در کانال", url=channel_url)],
+                [InlineKeyboardButton("✅ عضو شدم، بررسی کن", callback_data="check_membership")],
+            ]),
         )
         return
 
@@ -293,6 +302,23 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = user.id
     data = query.data
     full_name = " ".join(filter(None, [user.first_name, user.last_name])).strip() or "کاربر"
+
+    if data == "check_membership":
+        if CHANNEL_ID and not await check_user_membership(user_id, context.bot):
+            await query.answer("❌ هنوز عضو کانال نشدی! اول عضو شو بعد دکمه رو بزن.", show_alert=True)
+            return None
+
+        db_user = get_or_create_user(user_id, user.username, full_name)
+        first_name = escape(user.first_name or "داداش")
+        welcome_text = (
+            f"✅ خوش اومدی <b>{first_name}</b>! عضویتت تأیید شد.\n\n"
+            "با منوی زیر می‌تونی هرچی دلت خواست رو با بالاترین کیفیت و بهترین قیمت واسه خودت دست و پا کنی.\n\n"
+            "🔸 واسه شروع، یکی از گزینه‌های زیرو خیلی یواش لمس کن:"
+        )
+        await delete_message_safe(query)
+        await send_new_message(update, context, text=welcome_text, reply_markup=get_main_menu_keyboard())
+        return None
+
     db_user = get_or_create_user(user_id, user.username, full_name)
 
     if data.startswith("approve_order_"):
