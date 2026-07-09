@@ -6,7 +6,7 @@ if not BOT_TOKEN:
         "BOT_TOKEN تنظیم نشده است. لطفاً توکن را به صورت Environment Variable ست کن."
     )
 
-CHANNEL_ID = os.getenv("CHANNEL_ID", "@Trapxan")
+CHANNEL_ID = os.getenv("CHANNEL_ID", "@ArsalanVPN_Channel")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "5737414011"))
 TRANSACTION_LOG_CHANNEL_ID = int(os.getenv("TRANSACTION_LOG_CHANNEL_ID", "-1004491596177"))
 TOMAN_PER_STAR = int(os.getenv("TOMAN_PER_STAR", "2000"))

@@ -26,13 +26,15 @@ from handlers import (
     admin_list_keys,
     admin_list_configs,
     admin_help,
+    admin_panel,
+    admin_cancel,
 )
 import logging
 
 
 logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.ERROR
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.ERROR,
 )
 logger = logging.getLogger(__name__)
 
@@ -44,7 +46,7 @@ def main():
 
     receipt_conv_handler = ConversationHandler(
         entry_points=[
-            CallbackQueryHandler(start_receipt_conversation, pattern="^send_receipt_step")
+            CallbackQueryHandler(start_receipt_conversation, pattern="^send_receipt_step$")
         ],
         states={
             WAITING_FOR_RECEIPT: [
@@ -67,11 +69,14 @@ def main():
     )
 
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("adminpanel", admin_panel))
     app.add_handler(CommandHandler("addconfig", admin_add_config))
     app.add_handler(CommandHandler("delconfig", admin_delete_config))
     app.add_handler(CommandHandler("listkeys", admin_list_keys))
     app.add_handler(CommandHandler("listconfigs", admin_list_configs))
     app.add_handler(CommandHandler("adminhelp", admin_help))
+    app.add_handler(CommandHandler("helpadmin", admin_help))
+    app.add_handler(CommandHandler("cancel", admin_cancel))
     app.add_handler(receipt_conv_handler)
     app.add_handler(topup_conv_handler)
     app.add_handler(CallbackQueryHandler(button_handler))

@@ -1,5 +1,7 @@
 import sqlite3
-from typing import Optional, List
+from typing import List, Optional, Tuple
+
+import jdatetime
 
 from config import DB_PATH
 
@@ -7,7 +9,6 @@ from config import DB_PATH
 def init_db() -> None:
     with sqlite3.connect(DB_PATH) as conn:
         c = conn.cursor()
-        # جدول کاربران
         c.execute(
             """
             CREATE TABLE IF NOT EXISTS users (
@@ -22,18 +23,16 @@ def init_db() -> None:
             )
             """
         )
-        # جدول کانفیگ‌ها (موجودی انبار)
         c.execute(
             """
             CREATE TABLE IF NOT EXISTS configs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 product_key TEXT,
                 link TEXT,
-                status TEXT DEFAULT 'available' -- available, sold
+                status TEXT DEFAULT 'available'
             )
             """
         )
-        # جدول سفارشات
         c.execute(
             """
             CREATE TABLE IF NOT EXISTS orders (
@@ -41,9 +40,29 @@ def init_db() -> None:
                 user_id INTEGER,
                 product_key TEXT,
                 price INTEGER,
-                status TEXT DEFAULT 'pending', -- pending, completed, failed
+                status TEXT DEFAULT 'pending',
                 assigned_config_id INTEGER,
                 order_date TEXT,
+                FOREIGN KEY(user_id) REFERENCES users(user_id)
+            )
+            """
+        )
+        c.execute(
+            """
+            CREATE TABLE IF NOT EXISTS user_services (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                username TEXT,
+                service_type TEXT NOT NULL,
+                product_key TEXT,
+                config_id INTEGER,
+                link TEXT,
+                size TEXT,
+                duration_days INTEGER,
+                start_date TEXT,
+                expiry_date TEXT,
+                remaining_volume TEXT,
+                status TEXT DEFAULT 'active',
                 FOREIGN KEY(user_id) REFERENCES users(user_id)
             )
             """
@@ -58,22 +77,23 @@ def get_or_create_user(user_id: int, username: Optional[str], full_name: str) ->
         row = c.fetchone()
 
         if row:
-            c.execute("UPDATE users SET username = ?, full_name = ? WHERE user_id = ?", (username, full_name, user_id))
+            c.execute(
+                "UPDATE users SET username = ?, full_name = ? WHERE user_id = ?",
+                (username, full_name, user_id),
+            )
             conn.commit()
-
             c.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
             updated_row = c.fetchone()
             return dict(zip([column[0] for column in c.description], updated_row))
 
         import uuid
-        import jdatetime
 
         ref_code = str(uuid.uuid4().hex)[:12]
         now = jdatetime.datetime.now().strftime("%Y/%m/%d %H:%M:%S")
 
         c.execute(
             "INSERT INTO users (user_id, username, full_name, balance, referral_code, join_date) VALUES (?, ?, ?, ?, ?, ?)",
-            (user_id, username, full_name, 0, ref_code, now)
+            (user_id, username, full_name, 0, ref_code, now),
         )
         conn.commit()
 
@@ -98,7 +118,7 @@ def has_used_test_account(user_id: int) -> bool:
         return bool(res[0]) if res else False
 
 
-def mark_test_account_used(user_id: int):
+def mark_test_account_used(user_id: int) -> None:
     with sqlite3.connect(DB_PATH) as conn:
         c = conn.cursor()
         c.execute("UPDATE users SET test_account_used = 1 WHERE user_id = ?", (user_id,))
@@ -108,29 +128,34 @@ def mark_test_account_used(user_id: int):
 def get_available_config(product_key: str) -> Optional[dict]:
     with sqlite3.connect(DB_PATH) as conn:
         c = conn.cursor()
-        c.execute("SELECT * FROM configs WHERE product_key = ? AND status = 'available' LIMIT 1", (product_key,))
+        c.execute(
+            "SELECT * FROM configs WHERE product_key = ? AND status = 'available' LIMIT 1",
+            (product_key,),
+        )
         row = c.fetchone()
         if row:
             return {"id": row[0], "product_key": row[1], "link": row[2], "status": row[3]}
         return None
 
 
-def assign_config_to_order(order_id: int, config_id: int):
+def assign_config_to_order(order_id: int, config_id: int) -> None:
     with sqlite3.connect(DB_PATH) as conn:
         c = conn.cursor()
         c.execute("UPDATE configs SET status = 'sold' WHERE id = ?", (config_id,))
-        c.execute("UPDATE orders SET status = 'completed', assigned_config_id = ? WHERE id = ?", (config_id, order_id))
+        c.execute(
+            "UPDATE orders SET status = 'completed', assigned_config_id = ? WHERE id = ?",
+            (config_id, order_id),
+        )
         conn.commit()
 
 
 def create_order(user_id: int, product_key: str, price: int) -> int:
-    import jdatetime
     now = jdatetime.datetime.now().strftime("%Y/%m/%d %H:%M:%S")
     with sqlite3.connect(DB_PATH) as conn:
         c = conn.cursor()
         c.execute(
             "INSERT INTO orders (user_id, product_key, price, order_date) VALUES (?, ?, ?, ?)",
-            (user_id, product_key, price, now)
+            (user_id, product_key, price, now),
         )
         conn.commit()
         return c.lastrowid
@@ -139,45 +164,63 @@ def create_order(user_id: int, product_key: str, price: int) -> int:
 def get_user_orders(user_id: int) -> List[dict]:
     with sqlite3.connect(DB_PATH) as conn:
         c = conn.cursor()
-        c.execute("""
-            SELECT o.id, o.product_key, o.order_date, c.link 
-            FROM orders o 
+        c.execute(
+            """
+            SELECT o.id, o.product_key, o.order_date, c.link
+            FROM orders o
             LEFT JOIN configs c ON o.assigned_config_id = c.id
             WHERE o.user_id = ? AND o.status = 'completed'
             ORDER BY o.id DESC
-        """, (user_id,))
+            """,
+            (user_id,),
+        )
         return [{"id": r[0], "product_key": r[1], "date": r[2], "link": r[3]} for r in c.fetchall()]
 
 
 # ---------------------------------------------------------------------------
-# توابع جدید: مدیریت موجودی لینک‌ها توسط ادمین
+# مدیریت موجودی لینک‌ها
 # ---------------------------------------------------------------------------
 
 def add_config(product_key: str, link: str) -> int:
-    """یک لینک کانفیگ/ساب جدید برای یک محصول مشخص (یا 'test_config') در انبار ذخیره می‌کند."""
     with sqlite3.connect(DB_PATH) as conn:
         c = conn.cursor()
         c.execute(
             "INSERT INTO configs (product_key, link, status) VALUES (?, ?, 'available')",
-            (product_key, link)
+            (product_key, link),
         )
         conn.commit()
         return c.lastrowid
 
 
+def add_configs_batch(entries: List[Tuple[str, str]]) -> List[dict]:
+    """چند لینک را در یک تراکنش اضافه می‌کند."""
+    if not entries:
+        return []
+
+    results = []
+    with sqlite3.connect(DB_PATH) as conn:
+        c = conn.cursor()
+        for product_key, link in entries:
+            c.execute(
+                "INSERT INTO configs (product_key, link, status) VALUES (?, ?, 'available')",
+                (product_key, link),
+            )
+            results.append({"product_key": product_key, "config_id": c.lastrowid})
+        conn.commit()
+    return results
+
+
 def count_available_configs(product_key: str) -> int:
-    """تعداد لینک‌های موجود (فروخته نشده) برای یک محصول را برمی‌گرداند."""
     with sqlite3.connect(DB_PATH) as conn:
         c = conn.cursor()
         c.execute(
             "SELECT COUNT(*) FROM configs WHERE product_key = ? AND status = 'available'",
-            (product_key,)
+            (product_key,),
         )
         return c.fetchone()[0]
 
 
 def get_stock_summary() -> List[dict]:
-    """موجودی همه‌ی محصولات (فقط لینک‌های available) را برمی‌گرداند."""
     with sqlite3.connect(DB_PATH) as conn:
         c = conn.cursor()
         c.execute(
@@ -192,6 +235,18 @@ def delete_config(config_id: int) -> bool:
         c.execute("DELETE FROM configs WHERE id = ? AND status = 'available'", (config_id,))
         conn.commit()
         return c.rowcount > 0
+
+
+def delete_configs_by_product(product_key: str) -> int:
+    """تمام لینک‌های available یک محصول را حذف می‌کند."""
+    with sqlite3.connect(DB_PATH) as conn:
+        c = conn.cursor()
+        c.execute(
+            "DELETE FROM configs WHERE product_key = ? AND status = 'available'",
+            (product_key,),
+        )
+        conn.commit()
+        return c.rowcount
 
 
 def get_config_by_id(config_id: int) -> Optional[dict]:
@@ -209,13 +264,13 @@ def get_configs_by_product(product_key: str, limit: int = 30) -> List[dict]:
         c = conn.cursor()
         c.execute(
             "SELECT id, link FROM configs WHERE product_key = ? AND status = 'available' ORDER BY id ASC LIMIT ?",
-            (product_key, limit)
+            (product_key, limit),
         )
         return [{"id": r[0], "link": r[1]} for r in c.fetchall()]
 
 
 # ---------------------------------------------------------------------------
-# توابع جدید: مدیریت سفارشات (برای تایید/رد امن بدون وابستگی به پارس کردن رشته)
+# مدیریت سفارشات
 # ---------------------------------------------------------------------------
 
 def get_order_by_id(order_id: int) -> Optional[dict]:
@@ -223,7 +278,7 @@ def get_order_by_id(order_id: int) -> Optional[dict]:
         c = conn.cursor()
         c.execute(
             "SELECT id, user_id, product_key, price, status, assigned_config_id, order_date FROM orders WHERE id = ?",
-            (order_id,)
+            (order_id,),
         )
         row = c.fetchone()
         if not row:
@@ -258,3 +313,82 @@ def mark_config_sold(config_id: int) -> None:
         c = conn.cursor()
         c.execute("UPDATE configs SET status = 'sold' WHERE id = ?", (config_id,))
         conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# سرویس‌های فعال کاربران (برای پنل ادمین)
+# ---------------------------------------------------------------------------
+
+def create_user_service(
+    user_id: int,
+    username: Optional[str],
+    service_type: str,
+    product_key: str,
+    config_id: int,
+    link: str,
+    size: str,
+    duration_days: int,
+) -> int:
+    now = jdatetime.datetime.now()
+    start_date = now.strftime("%Y/%m/%d %H:%M:%S")
+    expiry = now + jdatetime.timedelta(days=duration_days)
+    expiry_date = expiry.strftime("%Y/%m/%d %H:%M:%S")
+
+    with sqlite3.connect(DB_PATH) as conn:
+        c = conn.cursor()
+        c.execute(
+            """
+            INSERT INTO user_services
+            (user_id, username, service_type, product_key, config_id, link, size,
+             duration_days, start_date, expiry_date, remaining_volume, status)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active')
+            """,
+            (
+                user_id,
+                username,
+                service_type,
+                product_key,
+                config_id,
+                link,
+                size,
+                duration_days,
+                start_date,
+                expiry_date,
+                size,
+            ),
+        )
+        conn.commit()
+        return c.lastrowid
+
+
+def get_user_services_list(limit: int = 10, offset: int = 0) -> List[dict]:
+    with sqlite3.connect(DB_PATH) as conn:
+        c = conn.cursor()
+        c.execute(
+            """
+            SELECT s.id, s.user_id, s.username, s.service_type, s.product_key,
+                   s.size, s.expiry_date, s.remaining_volume, s.status, u.full_name
+            FROM user_services s
+            LEFT JOIN users u ON s.user_id = u.user_id
+            WHERE s.status = 'active'
+            ORDER BY s.id DESC
+            LIMIT ? OFFSET ?
+            """,
+            (limit, offset),
+        )
+        columns = [col[0] for col in c.description]
+        return [dict(zip(columns, row)) for row in c.fetchall()]
+
+
+def count_active_user_services() -> int:
+    with sqlite3.connect(DB_PATH) as conn:
+        c = conn.cursor()
+        c.execute("SELECT COUNT(*) FROM user_services WHERE status = 'active'")
+        return c.fetchone()[0]
+
+
+def get_all_user_ids() -> List[int]:
+    with sqlite3.connect(DB_PATH) as conn:
+        c = conn.cursor()
+        c.execute("SELECT user_id FROM users")
+        return [row[0] for row in c.fetchall()]
