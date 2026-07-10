@@ -244,12 +244,23 @@ async def _deliver_product(
         link=config_data["link"],
     )
 
-    sent_message = await context.bot.send_message(
-        chat_id=customer_id,
-        text=success_text,
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 منوی اصلی", callback_data="main_menu")]]),
-    )
+    reply_markup = InlineKeyboardMarkup([[InlineKeyboardButton("🏠 منوی اصلی", callback_data="main_menu")]])
+
+    sent_message = None
+    try:
+        qr_bio = generate_qr_code(config_data["link"])
+        sent_message = await context.bot.send_photo(
+            chat_id=customer_id,
+            photo=qr_bio,
+            caption=success_text,
+            parse_mode="HTML",
+            reply_markup=reply_markup,
+        )
+    except Exception as e:
+        print(f"Could not generate/send QR code for {customer_id}: {e}")
+        sent_message = await context.bot.send_message(
+            chat_id=customer_id, text=success_text, parse_mode="HTML", reply_markup=reply_markup,
+        )
 
     try:
         await context.bot.pin_chat_message(
@@ -257,16 +268,6 @@ async def _deliver_product(
         )
     except TelegramError as e:
         print(f"Could not pin service-delivered message for {customer_id}: {e}")
-
-    try:
-        qr_bio = generate_qr_code(config_data["link"])
-        await context.bot.send_photo(
-            chat_id=customer_id,
-            photo=qr_bio,
-            caption="📱 برای اتصال سریع‌تر می‌تونی این QR Code رو هم اسکن کنی.",
-        )
-    except Exception as e:
-        print(f"Could not generate/send QR code for {customer_id}: {e}")
 
     await notify_admin_service_delivered(
         context,
@@ -1099,7 +1100,7 @@ async def _handle_test_account(update, context, query, user, user_id, mark_and_a
         test_config["id"], service_type="تستی",
     )
 
-    text = (
+    caption = (
         "🎁 <b>سرویس تست شما فعال شد!</b>\n"
         "━━━━━━━━━━━━━━━\n"
         f"👤 <b>نام کاربری:</b> <code>{user_id}_test</code>\n"
@@ -1111,10 +1112,26 @@ async def _handle_test_account(update, context, query, user, user_id, mark_and_a
         f"🔗 <code>{test_config['link']}</code>"
     )
     await delete_message_safe(query)
-    sent_message = await send_new_message(update, context, text=text, reply_markup=InlineKeyboardMarkup([
-        [InlineKeyboardButton("📚 آموزش اتصال", callback_data="tutorial")],
-        [InlineKeyboardButton("🏠 منوی اصلی", callback_data="main_menu")],
-    ]))
+
+    sent_message = None
+    try:
+        qr_bio = generate_qr_code(test_config["link"])
+        sent_message = await context.bot.send_photo(
+            chat_id=user_id,
+            photo=qr_bio,
+            caption=caption,
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("📚 آموزش اتصال", callback_data="tutorial")],
+                [InlineKeyboardButton("🏠 منوی اصلی", callback_data="main_menu")],
+            ]),
+        )
+    except Exception as e:
+        print(f"Could not generate/send QR code for {user_id}: {e}")
+        sent_message = await send_new_message(update, context, text=caption, reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("📚 آموزش اتصال", callback_data="tutorial")],
+            [InlineKeyboardButton("🏠 منوی اصلی", callback_data="main_menu")],
+        ]))
 
     if sent_message is not None:
         try:
@@ -1123,16 +1140,6 @@ async def _handle_test_account(update, context, query, user, user_id, mark_and_a
             )
         except TelegramError as e:
             print(f"Could not pin test-account message for {user_id}: {e}")
-
-    try:
-        qr_bio = generate_qr_code(test_config["link"])
-        await context.bot.send_photo(
-            chat_id=user_id,
-            photo=qr_bio,
-            caption="📱 برای اتصال سریع‌تر می‌تونی این QR Code رو هم اسکن کنی.",
-        )
-    except Exception as e:
-        print(f"Could not generate/send QR code for {user_id}: {e}")
 
     return None
 

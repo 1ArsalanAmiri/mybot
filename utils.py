@@ -3,7 +3,12 @@ from typing import Any, Optional
 
 import jdatetime
 import io
+import random
 import qrcode
+from qrcode.image.styledpil import StyledPilImage
+from qrcode.image.styles.moduledrawers import RoundedModuleDrawer
+from qrcode.image.styles.colormasks import RadialGradiantColorMask
+from PIL import Image, ImageDraw, ImageFilter, ImageFont
 from telegram import Update, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
 from telegram.error import TelegramError
@@ -101,19 +106,120 @@ def build_service_delivered_text(
     )
 
 
-def generate_qr_code(data: str) -> io.BytesIO:
+def generate_qr_code(data: str, brand: str = "ArsalanVPN") -> io.BytesIO:
+    """یک QR Code شیک با ماژول‌های گرد، گرادیان رنگی و پس‌زمینه‌ی تزئینی می‌سازد."""
     qr = qrcode.QRCode(
         version=1,
-        error_correction=qrcode.constants.ERROR_CORRECT_L,
+        error_correction=qrcode.constants.ERROR_CORRECT_H,
         box_size=10,
-        border=4,
+        border=2,
     )
     qr.add_data(data)
     qr.make(fit=True)
-    img = qr.make_image(fill_color="black", back_color="white")
+
+    qr_img = qr.make_image(
+        image_factory=StyledPilImage,
+        module_drawer=RoundedModuleDrawer(radius_ratio=0.9),
+        color_mask=RadialGradiantColorMask(
+            back_color=(255, 255, 255),
+            center_color=(30, 58, 138),   # indigo
+            edge_color=(88, 28, 135),     # violet
+        ),
+    ).convert("RGBA")
+    qr_size = qr_img.size[0]
+
+    # کارت سفید گرد پشت QR برای حفظ کنتراست و quiet zone
+    card_pad = 60
+    card_size = qr_size + card_pad * 2
+    card = Image.new("RGBA", (card_size, card_size), (0, 0, 0, 0))
+    ImageDraw.Draw(card).rounded_rectangle(
+        [0, 0, card_size - 1, card_size - 1], radius=48, fill=(255, 255, 255, 255)
+    )
+    card.paste(qr_img, (card_pad, card_pad), qr_img)
+
+    # سایه‌ی نرم زیر کارت
+    shadow = Image.new("RGBA", (card_size + 40, card_size + 40), (0, 0, 0, 0))
+    ImageDraw.Draw(shadow).rounded_rectangle(
+        [20, 26, card_size + 20, card_size + 26], radius=48, fill=(0, 0, 0, 140)
+    )
+    shadow = shadow.filter(ImageFilter.GaussianBlur(18))
+
+    # بوم پس‌زمینه با گرادیان بنفش تیره به سرمه‌ای
+    pad_top, pad_bottom, pad_side = 130, 90, 70
+    W = card_size + pad_side * 2
+    H = card_size + pad_top + pad_bottom
+    bg = Image.new("RGB", (W, H), (0, 0, 0))
+    top_color, bottom_color = (23, 15, 60), (10, 12, 38)
+    px = bg.load()
+    for y in range(H):
+        t = y / H
+        r = int(top_color[0] + (bottom_color[0] - top_color[0]) * t)
+        g = int(top_color[1] + (bottom_color[1] - top_color[1]) * t)
+        b = int(top_color[2] + (bottom_color[2] - top_color[2]) * t)
+        for x in range(W):
+            px[x, y] = (r, g, b)
+    bg = bg.convert("RGBA")
+
+    # هاله‌ی نوری نرم پشت کارت
+    glow = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    gd = ImageDraw.Draw(glow)
+    cx, cy = W // 2, pad_top + card_size // 2
+    max_r = card_size // 2 + 90
+    for i in range(max_r, 0, -4):
+        alpha = int(70 * (1 - i / max_r))
+        gd.ellipse([cx - i, cy - i, cx + i, cy + i], fill=(124, 92, 255, alpha))
+    glow = glow.filter(ImageFilter.GaussianBlur(30))
+    bg = Image.alpha_composite(bg, glow)
+
+    # نقطه‌های ریز نورانی برای بافت
+    dots = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    dd = ImageDraw.Draw(dots)
+    random.seed(7)
+    for _ in range(70):
+        x, y = random.randint(0, W), random.randint(0, H)
+        r = random.choice([1, 1, 2])
+        a = random.randint(40, 130)
+        dd.ellipse([x - r, y - r, x + r, y + r], fill=(255, 255, 255, a))
+    bg = Image.alpha_composite(bg, dots)
+
+    bg.alpha_composite(shadow, (pad_side - 20, pad_top - 26))
+    bg.alpha_composite(card, (pad_side, pad_top))
+
+    # گوشه‌های تزئینی برای حس تکنولوژیک
+    accent = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    ad = ImageDraw.Draw(accent)
+    accent_color, L, thick = (167, 139, 250, 200), 46, 6
+    tr_x, bl_y = pad_side + card_size + 8, pad_top + card_size + 8
+    corners = [
+        [(pad_side - 8, pad_top - 8), (pad_side - 8 + L, pad_top - 8), (pad_side - 8, pad_top - 8), (pad_side - 8, pad_top - 8 + L)],
+        [(tr_x, pad_top - 8), (tr_x - L, pad_top - 8), (tr_x, pad_top - 8), (tr_x, pad_top - 8 + L)],
+        [(pad_side - 8, bl_y), (pad_side - 8 + L, bl_y), (pad_side - 8, bl_y), (pad_side - 8, bl_y - L)],
+        [(tr_x, bl_y), (tr_x - L, bl_y), (tr_x, bl_y), (tr_x, bl_y - L)],
+    ]
+    for p1, p2, p3, p4 in corners:
+        ad.line([p1, p2], fill=accent_color, width=thick)
+        ad.line([p3, p4], fill=accent_color, width=thick)
+    bg.alpha_composite(accent)
+
+    # عنوان برند و زیرنویس
+    draw = ImageDraw.Draw(bg)
+    try:
+        font_title = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 44)
+        font_sub = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 26)
+    except Exception:
+        font_title = ImageFont.load_default()
+        font_sub = ImageFont.load_default()
+
+    tb = draw.textbbox((0, 0), brand, font=font_title)
+    draw.text(((W - (tb[2] - tb[0])) / 2, 34), brand, font=font_title, fill=(255, 255, 255, 255))
+
+    sub_text = "Scan to connect"
+    sb = draw.textbbox((0, 0), sub_text, font=font_sub)
+    draw.text(((W - (sb[2] - sb[0])) / 2, H - pad_bottom + 22), sub_text, font=font_sub, fill=(200, 190, 255, 230))
+
     bio = io.BytesIO()
     bio.name = "qrcode.png"
-    img.save(bio, "PNG")
+    bg.convert("RGB").save(bio, "PNG")
     bio.seek(0)
     return bio
 
