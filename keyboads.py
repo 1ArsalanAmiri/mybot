@@ -66,7 +66,7 @@ def format_toman(amount) -> str:
         return str(amount)
 
 
-def get_main_menu_keyboard() -> InlineKeyboardMarkup:
+def get_main_menu_keyboard(show_admin_panel: bool = False) -> InlineKeyboardMarkup:
     keyboard = [
         [
             InlineKeyboardButton("🛒 خرید کانفیگ", callback_data="buy_config"),
@@ -84,6 +84,8 @@ def get_main_menu_keyboard() -> InlineKeyboardMarkup:
             InlineKeyboardButton("👨‍💻 پشتیبانی", callback_data="support"),
         ],
     ]
+    if show_admin_panel:
+        keyboard.append([InlineKeyboardButton("🛠 پنل مدیریت", callback_data="admin_panel")])
     return InlineKeyboardMarkup(keyboard)
 
 
@@ -183,11 +185,82 @@ def get_wallet_keyboard() -> InlineKeyboardMarkup:
 def get_admin_panel_keyboard() -> InlineKeyboardMarkup:
     keyboard = [
         [InlineKeyboardButton("📦 موجودی محصولات", callback_data="admin_stock")],
+        [InlineKeyboardButton("🛠 مدیریت کانفیگ‌ها", callback_data="admin_cfgpick_0")],
         [InlineKeyboardButton("👥 کاربران دارای سرویس", callback_data="admin_users_0")],
         [InlineKeyboardButton("📢 ارسال پیام همگانی", callback_data="admin_broadcast")],
         [InlineKeyboardButton("📚 راهنمای ادمین", callback_data="admin_help_panel")],
     ]
     return InlineKeyboardMarkup(keyboard)
+
+
+CONFIG_PAGE_SIZE = 8
+
+
+def get_admin_product_picker_keyboard(page: int, stock: Dict[str, int]) -> InlineKeyboardMarkup:
+    keys = ["test_config"] + list(PRODUCTS.keys())
+    total_pages = max(1, (len(keys) + CONFIG_PAGE_SIZE - 1) // CONFIG_PAGE_SIZE)
+    page = max(0, min(page, total_pages - 1))
+    start = page * CONFIG_PAGE_SIZE
+    page_keys = keys[start:start + CONFIG_PAGE_SIZE]
+
+    buttons = []
+    for key in page_keys:
+        count = stock.get(key, 0)
+        buttons.append([InlineKeyboardButton(f"{key} ({count})", callback_data=f"admin_cfgsel_{key}")])
+
+    nav_row = []
+    if page > 0:
+        nav_row.append(InlineKeyboardButton("◀️ قبلی", callback_data=f"admin_cfgpick_{page - 1}"))
+    if page < total_pages - 1:
+        nav_row.append(InlineKeyboardButton("بعدی ▶️", callback_data=f"admin_cfgpick_{page + 1}"))
+    if nav_row:
+        buttons.append(nav_row)
+    buttons.append([InlineKeyboardButton("🔙 بازگشت به پنل", callback_data="admin_panel")])
+    return InlineKeyboardMarkup(buttons)
+
+
+def get_admin_product_actions_keyboard(product_key: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("➕ افزودن لینک", callback_data=f"admin_cfgadd_{product_key}")],
+        [InlineKeyboardButton("📋 نمایش لینک‌ها (حذف تکی)", callback_data=f"admin_cfglist|{product_key}|0")],
+        [InlineKeyboardButton("🗑 حذف همه لینک‌های موجود", callback_data=f"admin_cfgdelall_{product_key}")],
+        [InlineKeyboardButton("🔙 بازگشت به لیست محصولات", callback_data="admin_cfgpick_0")],
+    ])
+
+
+def get_admin_config_list_keyboard(
+    product_key: str, page: int, configs_page: List[dict], has_prev: bool, has_next: bool
+) -> InlineKeyboardMarkup:
+    buttons = []
+    for cfg in configs_page:
+        short = cfg["link"] if len(cfg["link"]) <= 30 else cfg["link"][:27] + "..."
+        buttons.append([InlineKeyboardButton(
+            f"🗑 #{cfg['id']} {short}",
+            callback_data=f"admin_delonecfg|{cfg['id']}|{product_key}|{page}",
+        )])
+
+    nav_row = []
+    if has_prev:
+        nav_row.append(InlineKeyboardButton("◀️ قبلی", callback_data=f"admin_cfglist|{product_key}|{page - 1}"))
+    if has_next:
+        nav_row.append(InlineKeyboardButton("بعدی ▶️", callback_data=f"admin_cfglist|{product_key}|{page + 1}"))
+    if nav_row:
+        buttons.append(nav_row)
+    buttons.append([InlineKeyboardButton("🔙 بازگشت", callback_data=f"admin_cfgsel_{product_key}")])
+    return InlineKeyboardMarkup(buttons)
+
+
+def get_admin_delall_confirm_keyboard(product_key: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ بله، حذف کن", callback_data=f"admin_cfgdelallok_{product_key}")],
+        [InlineKeyboardButton("❌ انصراف", callback_data=f"admin_cfgsel_{product_key}")],
+    ])
+
+
+def get_admin_cancel_add_keyboard(product_key: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("❌ لغو افزودن", callback_data=f"admin_cfgsel_{product_key}")],
+    ])
 
 
 def get_admin_users_pagination_keyboard(page: int, total_pages: int) -> InlineKeyboardMarkup:

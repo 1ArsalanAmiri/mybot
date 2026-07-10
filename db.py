@@ -259,12 +259,13 @@ def get_config_by_id(config_id: int) -> Optional[dict]:
         return {"id": row[0], "product_key": row[1], "link": row[2], "status": row[3]}
 
 
-def get_configs_by_product(product_key: str, limit: int = 30) -> List[dict]:
+def get_configs_by_product(product_key: str, limit: int = 30, offset: int = 0) -> List[dict]:
     with sqlite3.connect(DB_PATH) as conn:
         c = conn.cursor()
         c.execute(
-            "SELECT id, link FROM configs WHERE product_key = ? AND status = 'available' ORDER BY id ASC LIMIT ?",
-            (product_key, limit),
+            "SELECT id, link FROM configs WHERE product_key = ? AND status = 'available' "
+            "ORDER BY id ASC LIMIT ? OFFSET ?",
+            (product_key, limit, offset),
         )
         return [{"id": r[0], "link": r[1]} for r in c.fetchall()]
 
@@ -367,7 +368,7 @@ def get_user_services_list(limit: int = 10, offset: int = 0) -> List[dict]:
         c.execute(
             """
             SELECT s.id, s.user_id, s.username, s.service_type, s.product_key,
-                   s.size, s.expiry_date, s.remaining_volume, s.status, u.full_name
+                   s.size, s.expiry_date, s.remaining_volume, s.status, s.link, u.full_name
             FROM user_services s
             LEFT JOIN users u ON s.user_id = u.user_id
             WHERE s.status = 'active'

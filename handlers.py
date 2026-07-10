@@ -35,12 +35,15 @@ from utils import (
     notify_admin_stars_purchase,
     notify_admin_service_delivered,
     get_jalali_now,
+    generate_qr_code,
 )
 from keyboads import (
     get_main_menu_keyboard, get_wallet_keyboard, get_support_keyboard, get_products_keyboard,
     DURATION_CODE_TO_DAYS, get_duration_menu_keyboard, get_payment_method_keyboard, PRODUCTS,
     get_buy_category_keyboard, get_unlimited_menu_keyboard,
     get_admin_panel_keyboard, get_admin_users_pagination_keyboard, get_admin_back_keyboard,
+    get_admin_product_picker_keyboard, get_admin_product_actions_keyboard,
+    get_admin_config_list_keyboard, get_admin_delall_confirm_keyboard, get_admin_cancel_add_keyboard,
 )
 
 # ---------------------------------------------------------------------------
@@ -52,7 +55,7 @@ WAITING_FOR_TOPUP_AMOUNT = 2
 WAITING_FOR_BROADCAST = 3
 
 ALLOWED_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
-USERS_PER_PAGE = 8
+USERS_PER_PAGE = 5
 VALID_PRODUCT_KEYS = set(PRODUCTS.keys()) | {"test_config"}
 
 BAD_WORDS = {
@@ -167,6 +170,7 @@ def _build_users_services_text(page: int) -> tuple:
         for svc in services:
             svc_type = "تستی" if svc["service_type"] == "test" else "پولی"
             username = f"@{svc['username']}" if svc.get("username") else (svc.get("full_name") or "بدون یوزرنیم")
+            link = svc.get("link") or "—"
             lines.append(
                 f"━━━━━━━━━━━━━━━\n"
                 f"🆔 <code>{svc['user_id']}</code>\n"
@@ -174,7 +178,8 @@ def _build_users_services_text(page: int) -> tuple:
                 f"🏷 نوع: {svc_type}\n"
                 f"📦 {escape(_product_label(svc['product_key']))}\n"
                 f"📅 انقضا: {svc['expiry_date']}\n"
-                f"🗜 حجم باقی‌مانده: {escape(str(svc['remaining_volume']))}"
+                f"🗜 حجم باقی‌مانده: {escape(str(svc['remaining_volume']))}\n"
+                f"🔗 <code>{escape(str(link))}</code>"
             )
     return "\n".join(lines), page, total_pages
 
@@ -239,12 +244,29 @@ async def _deliver_product(
         link=config_data["link"],
     )
 
-    await context.bot.send_message(
+    sent_message = await context.bot.send_message(
         chat_id=customer_id,
         text=success_text,
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 منوی اصلی", callback_data="main_menu")]]),
     )
+
+    try:
+        await context.bot.pin_chat_message(
+            chat_id=customer_id, message_id=sent_message.message_id, disable_notification=True,
+        )
+    except TelegramError as e:
+        print(f"Could not pin service-delivered message for {customer_id}: {e}")
+
+    try:
+        qr_bio = generate_qr_code(config_data["link"])
+        await context.bot.send_photo(
+            chat_id=customer_id,
+            photo=qr_bio,
+            caption="📱 برای اتصال سریع‌تر می‌تونی این QR Code رو هم اسکن کنی.",
+        )
+    except Exception as e:
+        print(f"Could not generate/send QR code for {customer_id}: {e}")
 
     await notify_admin_service_delivered(
         context,
@@ -304,7 +326,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await update.message.reply_text(
         text=welcome_text,
-        reply_markup=get_main_menu_keyboard(),
+        reply_markup=get_main_menu_keyboard(show_admin_panel=is_admin(user.id)),
         parse_mode="HTML",
     )
 
@@ -522,26 +544,32 @@ async def admin_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # پنل ادمین — Callback
 # ---------------------------------------------------------------------------
 
+CONFIG_LIST_PAGE_SIZE = 8
+
+
 async def _handle_admin_callbacks(query, context, data, mark_and_answer) -> bool:
-    """True اگر callback مربوط به ادمین بود و پردازش شد."""
+    """True اگر callback مربوط به بخش ادمین بود (چه پردازش موفق چه رد دسترسی)."""
+    if not data.startswith("admin_"):
+        return False
+
+    if not is_admin(query.from_user.id):
+        await mark_and_answer("⛔️ این بخش فقط برای ادمین است.", alert=True)
+        return True
+
+    # اگر ادمین وسط فلوی «افزودن لینک» به بخش دیگری بره، حالت انتظار پاک می‌شه
+    if not data.startswith("admin_cfgadd_"):
+        context.user_data.pop("awaiting_config_add", None)
+
     if data == "admin_panel":
-        if not is_admin(query.from_user.id):
-            await mark_and_answer("⛔️ فقط ادمین.", alert=True)
-            return True
+        context.user_data.pop("awaiting_broadcast", None)
         await _edit_admin_message(query, "🛠 <b>پنل مدیریت</b>\n\nیکی از گزینه‌ها را انتخاب کن:", get_admin_panel_keyboard())
         return True
 
     if data == "admin_stock":
-        if not is_admin(query.from_user.id):
-            await mark_and_answer("⛔️ فقط ادمین.", alert=True)
-            return True
         await _edit_admin_message(query, _build_stock_text(), get_admin_back_keyboard())
         return True
 
     if data.startswith("admin_users_"):
-        if not is_admin(query.from_user.id):
-            await mark_and_answer("⛔️ فقط ادمین.", alert=True)
-            return True
         try:
             page = int(data.rsplit("_", 1)[-1])
         except ValueError:
@@ -551,25 +579,156 @@ async def _handle_admin_callbacks(query, context, data, mark_and_answer) -> bool
         return True
 
     if data == "admin_broadcast":
-        if not is_admin(query.from_user.id):
-            await mark_and_answer("⛔️ فقط ادمین.", alert=True)
-            return True
         context.user_data["awaiting_broadcast"] = True
         await _edit_admin_message(
             query,
-            "📢 <b>پیام همگانی</b>\n\nمتن پیام را ارسال کن.\nبرای لغو: /cancel",
+            "📢 <b>پیام همگانی</b>\n\nمتن پیام را ارسال کن.\nبرای لغو: /cancel یا دکمه بازگشت.",
             get_admin_back_keyboard(),
         )
         return True
 
     if data == "admin_help_panel":
-        if not is_admin(query.from_user.id):
-            await mark_and_answer("⛔️ فقط ادمین.", alert=True)
-            return True
         await _edit_admin_message(query, _admin_help_text(), get_admin_back_keyboard())
         return True
 
+    # -----------------------------------------------------------------
+    # مدیریت کانفیگ‌ها (کاملاً دکمه‌ای)
+    # -----------------------------------------------------------------
+
+    if data.startswith("admin_cfgpick_"):
+        try:
+            page = int(data[len("admin_cfgpick_"):])
+        except ValueError:
+            page = 0
+        stock = {row["product_key"]: row["count"] for row in get_stock_summary()}
+        await _edit_admin_message(
+            query,
+            "🛠 <b>مدیریت کانفیگ‌ها</b>\n\nیک محصول را برای مدیریت انتخاب کن:",
+            get_admin_product_picker_keyboard(page, stock),
+        )
+        return True
+
+    if data.startswith("admin_cfgsel_"):
+        product_key = data[len("admin_cfgsel_"):]
+        if not is_valid_product_key(product_key):
+            await mark_and_answer("⚠️ محصول نامعتبر.", alert=True)
+            return True
+        remaining = count_available_configs(product_key)
+        label = _product_label(product_key)
+        text = (
+            f"🛠 <b>مدیریت {escape(label)}</b>\n"
+            f"🔑 <code>{escape(product_key)}</code>\n"
+            f"📦 موجودی فعلی: <b>{remaining}</b>"
+        )
+        await _edit_admin_message(query, text, get_admin_product_actions_keyboard(product_key))
+        return True
+
+    if data.startswith("admin_cfgadd_"):
+        product_key = data[len("admin_cfgadd_"):]
+        if not is_valid_product_key(product_key):
+            await mark_and_answer("⚠️ محصول نامعتبر.", alert=True)
+            return True
+        context.user_data["awaiting_config_add"] = product_key
+        await _edit_admin_message(
+            query,
+            f"➕ <b>افزودن لینک برای</b> <code>{escape(product_key)}</code>\n\n"
+            "یک یا چند لینک بفرست؛ هر لینک در یک خط جداگانه.\n"
+            "برای لغو /cancel بزن یا دکمه زیر رو بزن.",
+            get_admin_cancel_add_keyboard(product_key),
+        )
+        return True
+
+    if data.startswith("admin_cfglist|"):
+        try:
+            _, product_key, page_str = data.split("|", 2)
+            page = int(page_str)
+        except (ValueError, IndexError):
+            await mark_and_answer("خطای داخلی در پردازش.", alert=True)
+            return True
+        if not is_valid_product_key(product_key):
+            await mark_and_answer("⚠️ محصول نامعتبر.", alert=True)
+            return True
+        await _render_config_list(query, product_key, page)
+        return True
+
+    if data.startswith("admin_delonecfg|"):
+        try:
+            _, cfg_id_str, product_key, page_str = data.split("|", 3)
+            cfg_id = int(cfg_id_str)
+            page = int(page_str)
+        except (ValueError, IndexError):
+            await mark_and_answer("خطای داخلی در پردازش.", alert=True)
+            return True
+
+        config = get_config_by_id(cfg_id)
+        if not config or config["status"] != "available":
+            await mark_and_answer("⚠️ این لینک قبلاً حذف یا فروخته شده.", alert=True)
+        else:
+            delete_config(cfg_id)
+            await log_admin_event(
+                context, "حذف کانفیگ (پنل)",
+                f"شناسه: <code>{cfg_id}</code>\nمحصول: <code>{escape(product_key)}</code>",
+            )
+        await _render_config_list(query, product_key, page)
+        return True
+
+    if data.startswith("admin_cfgdelallok_"):
+        product_key = data[len("admin_cfgdelallok_"):]
+        if not is_valid_product_key(product_key):
+            await mark_and_answer("⚠️ محصول نامعتبر.", alert=True)
+            return True
+        deleted = delete_configs_by_product(product_key)
+        remaining = count_available_configs(product_key)
+        await _edit_admin_message(
+            query,
+            f"🗑 <b>{deleted}</b> لینک از <code>{escape(product_key)}</code> حذف شد.\n📦 موجودی باقی‌مانده: {remaining}",
+            get_admin_product_actions_keyboard(product_key),
+        )
+        await log_admin_event(
+            context, "حذف گروهی کانفیگ (پنل)",
+            f"محصول: <code>{escape(product_key)}</code>\nتعداد: {deleted}",
+        )
+        return True
+
+    if data.startswith("admin_cfgdelall_"):
+        product_key = data[len("admin_cfgdelall_"):]
+        if not is_valid_product_key(product_key):
+            await mark_and_answer("⚠️ محصول نامعتبر.", alert=True)
+            return True
+        remaining = count_available_configs(product_key)
+        await _edit_admin_message(
+            query,
+            f"⚠️ مطمئنی می‌خوای همه‌ی <b>{remaining}</b> لینک موجود <code>{escape(product_key)}</code> حذف بشه؟\n"
+            "این کار قابل بازگشت نیست.",
+            get_admin_delall_confirm_keyboard(product_key),
+        )
+        return True
+
     return False
+
+
+async def _render_config_list(query, product_key: str, page: int) -> None:
+    total = count_available_configs(product_key)
+    total_pages = max(1, (total + CONFIG_LIST_PAGE_SIZE - 1) // CONFIG_LIST_PAGE_SIZE)
+    page = max(0, min(page, total_pages - 1))
+    offset = page * CONFIG_LIST_PAGE_SIZE
+    configs = get_configs_by_product(product_key, limit=CONFIG_LIST_PAGE_SIZE, offset=offset)
+
+    if not configs:
+        text = f"📦 هیچ لینک موجودی برای <code>{escape(product_key)}</code> نیست."
+    else:
+        lines = [f"📋 <b>لینک‌های {escape(product_key)}</b> (صفحه {page + 1}/{total_pages})\n"]
+        for cfg in configs:
+            short_link = cfg["link"] if len(cfg["link"]) <= 60 else cfg["link"][:57] + "..."
+            lines.append(f"• #{cfg['id']} → <code>{escape(short_link)}</code>")
+        text = "\n".join(lines)
+
+    keyboard = get_admin_config_list_keyboard(
+        product_key, page, configs,
+        has_prev=page > 0, has_next=page < total_pages - 1,
+    )
+    await _edit_admin_message(query, text, keyboard)
+
 
 
 async def admin_broadcast_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -614,11 +773,63 @@ async def admin_broadcast_handler(update: Update, context: ContextTypes.DEFAULT_
     )
 
 
+async def admin_config_add_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    message = update.effective_message
+
+    if not user or not is_admin(user.id):
+        return
+
+    product_key = context.user_data.get("awaiting_config_add")
+    if not product_key:
+        return
+
+    if not message or not message.text:
+        await message.reply_text("❌ فقط متن (لینک) ارسال کن.")
+        return
+
+    text = message.text.strip()
+    if text == "/cancel":
+        context.user_data.pop("awaiting_config_add", None)
+        await message.reply_text("❌ افزودن لغو شد.", reply_markup=get_admin_product_actions_keyboard(product_key))
+        return
+
+    if not is_valid_product_key(product_key):
+        context.user_data.pop("awaiting_config_add", None)
+        await message.reply_text("⚠️ محصول نامعتبر شده. دوباره از پنل شروع کن.", reply_markup=get_admin_panel_keyboard())
+        return
+
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    if not lines:
+        await message.reply_text("❌ چیزی دریافت نشد. یک لینک (یا چند لینک، هر خط یکی) بفرست.")
+        return
+
+    if len(lines) == 1:
+        add_config(product_key, lines[0])
+        added = 1
+    else:
+        add_configs_batch([(product_key, link) for link in lines])
+        added = len(lines)
+
+    context.user_data.pop("awaiting_config_add", None)
+    remaining = count_available_configs(product_key)
+    await message.reply_text(
+        f"✅ {added} لینک برای <code>{escape(product_key)}</code> اضافه شد.\n📦 موجودی فعلی: {remaining}",
+        parse_mode="HTML",
+        reply_markup=get_admin_product_actions_keyboard(product_key),
+    )
+    await log_admin_event(
+        context, "افزودن کانفیگ (پنل)",
+        f"محصول: <code>{escape(product_key)}</code>\nتعداد: {added}\nادمین: <code>{user.id}</code>",
+    )
+
+
 async def admin_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not user or not is_admin(user.id):
         return
     context.user_data.pop("awaiting_broadcast", None)
+    context.user_data.pop("awaiting_config_add", None)
     await update.message.reply_text("❌ عملیات لغو شد.", reply_markup=get_admin_panel_keyboard())
 
 
@@ -665,7 +876,7 @@ async def _button_handler_impl(update: Update, context: ContextTypes.DEFAULT_TYP
             "🔸 واسه شروع، یکی از گزینه‌های زیرو خیلی یواش لمس کن:"
         )
         await delete_message_safe(query)
-        await send_new_message(update, context, text=welcome_text, reply_markup=get_main_menu_keyboard())
+        await send_new_message(update, context, text=welcome_text, reply_markup=get_main_menu_keyboard(show_admin_panel=is_admin(user_id)))
         return None
 
     db_user = get_or_create_user(user_id, user.username, full_name)
@@ -737,7 +948,7 @@ async def _button_handler_impl(update: Update, context: ContextTypes.DEFAULT_TYP
 
     if data == "main_menu":
         await delete_message_safe(query)
-        await send_new_message(update, context, text="🔸 یکی از گزینه‌های زیر را انتخاب کن:", reply_markup=get_main_menu_keyboard())
+        await send_new_message(update, context, text="🔸 یکی از گزینه‌های زیر را انتخاب کن:", reply_markup=get_main_menu_keyboard(show_admin_panel=is_admin(user_id)))
         return None
 
     if data == "pay_card":
@@ -900,10 +1111,29 @@ async def _handle_test_account(update, context, query, user, user_id, mark_and_a
         f"🔗 <code>{test_config['link']}</code>"
     )
     await delete_message_safe(query)
-    await send_new_message(update, context, text=text, reply_markup=InlineKeyboardMarkup([
+    sent_message = await send_new_message(update, context, text=text, reply_markup=InlineKeyboardMarkup([
         [InlineKeyboardButton("📚 آموزش اتصال", callback_data="tutorial")],
         [InlineKeyboardButton("🏠 منوی اصلی", callback_data="main_menu")],
     ]))
+
+    if sent_message is not None:
+        try:
+            await context.bot.pin_chat_message(
+                chat_id=user_id, message_id=sent_message.message_id, disable_notification=True,
+            )
+        except TelegramError as e:
+            print(f"Could not pin test-account message for {user_id}: {e}")
+
+    try:
+        qr_bio = generate_qr_code(test_config["link"])
+        await context.bot.send_photo(
+            chat_id=user_id,
+            photo=qr_bio,
+            caption="📱 برای اتصال سریع‌تر می‌تونی این QR Code رو هم اسکن کنی.",
+        )
+    except Exception as e:
+        print(f"Could not generate/send QR code for {user_id}: {e}")
+
     return None
 
 
@@ -1292,9 +1522,13 @@ async def debug_get_chat_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     message = update.effective_message
 
-    if user and is_admin(user.id) and context.user_data.get("awaiting_broadcast"):
-        await admin_broadcast_handler(update, context)
-        return
+    if user and is_admin(user.id):
+        if context.user_data.get("awaiting_broadcast"):
+            await admin_broadcast_handler(update, context)
+            return
+        if context.user_data.get("awaiting_config_add"):
+            await admin_config_add_message_handler(update, context)
+            return
 
     if message and message.text and contains_profanity(message.text):
         await message.reply_text("خودتی 🖕")
