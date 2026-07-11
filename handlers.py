@@ -16,7 +16,7 @@ from db import (
     get_order_by_id, update_order_status,
     add_user_balance, mark_config_sold,
     create_user_service, get_user_services_list, count_active_user_services,
-    get_all_user_ids,
+    get_all_user_ids, get_services_by_user, get_user_service_by_id,
 )
 from utils import (
     build_order_text,
@@ -36,14 +36,16 @@ from utils import (
     notify_admin_service_delivered,
     get_jalali_now,
     generate_qr_code,
+    fetch_subscription_stats,
 )
 from keyboads import (
     get_main_menu_keyboard, get_wallet_keyboard, get_support_keyboard, get_products_keyboard,
     DURATION_CODE_TO_DAYS, get_duration_menu_keyboard, get_payment_method_keyboard, PRODUCTS,
-    get_buy_category_keyboard, get_unlimited_menu_keyboard,
+    get_buy_category_keyboard, get_unlimited_menu_keyboard, UNLIMITED_DURATION_LABELS,
     get_admin_panel_keyboard, get_admin_users_pagination_keyboard, get_admin_back_keyboard,
     get_admin_product_picker_keyboard, get_admin_product_actions_keyboard,
     get_admin_config_list_keyboard, get_admin_delall_confirm_keyboard, get_admin_cancel_add_keyboard,
+    get_service_detail_keyboard,
 )
 
 # ---------------------------------------------------------------------------
@@ -94,6 +96,30 @@ def _product_label(product_key: str) -> str:
     if product:
         return f"{product.get('size', '')} / {product.get('duration', '')} روزه"
     return product_key
+
+
+_DURATION_DAYS_LABELS = {
+    "30": "یک ماهه",
+    "60": "دو ماهه",
+    "90": "سه ماهه",
+    "180": "شش ماهه",
+    "365": "یکساله",
+}
+
+
+def _service_product_label(product_key: str) -> str:
+    """نام شیک محصول برای نمایش در صفحه‌ی جزئیات سرویس (مثلاً «یک ماهه نامحدود 💎»)."""
+    if product_key == "test_config":
+        return "سرویس تست 🧪"
+
+    product = PRODUCTS.get(product_key)
+    if not product:
+        return f"{product_key} 💎"
+
+    duration_label = _DURATION_DAYS_LABELS.get(product.get("duration", ""), f"{product.get('duration')} روزه")
+    if product.get("category") == "unlimited":
+        return f"{duration_label} نامحدود 💎"
+    return f"{duration_label} {product.get('size', '')} 💎"
 
 
 def _is_image_document(doc) -> bool:
@@ -894,6 +920,13 @@ async def _button_handler_impl(update: Update, context: ContextTypes.DEFAULT_TYP
     if data == "my_services":
         return await _handle_my_services(update, context, query, user_id)
 
+    if data.startswith("myservice_") or data.startswith("svcrefresh_"):
+        try:
+            service_id = int(data.split("_", 1)[1])
+        except (ValueError, IndexError):
+            return None
+        return await _handle_show_service(update, context, query, user_id, service_id, mark_and_answer)
+
     if data == "wallet_profile":
         return await _handle_wallet_profile(update, context, query, user_id, full_name, db_user)
 
@@ -1144,21 +1177,94 @@ async def _handle_test_account(update, context, query, user, user_id, mark_and_a
     return None
 
 
+SERVICE_LOCATION_LABEL = "Netherlands 🇳🇱"
+
+
 async def _handle_my_services(update, context, query, user_id):
-    orders = get_user_orders(user_id)
+    services = get_services_by_user(user_id)
     text = "🛍 <b>اشتراک‌های شما</b>\n\nروی هر سرویس کلیک کنید."
     buttons = []
-    if orders:
-        for order in orders:
+    if services:
+        for svc in services:
+            label = _service_product_label(svc["product_key"])
             buttons.append([InlineKeyboardButton(
-                f"سرویس {order['product_key']} - {order['date']}",
-                callback_data=f"show_service_{order['id']}",
+                f"{label} — {svc['start_date']}",
+                callback_data=f"myservice_{svc['id']}",
             )])
     else:
-        buttons.append([InlineKeyboardButton("هنوز سفارشی ندارید 🙁", callback_data="#")])
+        buttons.append([InlineKeyboardButton("هنوز سرویسی ندارید 🙁", callback_data="#")])
     buttons.append([InlineKeyboardButton("🔙 بازگشت", callback_data="main_menu")])
     await delete_message_safe(query)
     await send_new_message(update, context, text=text, reply_markup=InlineKeyboardMarkup(buttons))
+    return None
+
+
+async def _render_service_detail_text(svc: dict) -> str:
+    stats = await fetch_subscription_stats(svc["link"])
+
+    if svc["service_type"] == "test":
+        service_username = f"{svc['user_id']}_test"
+    else:
+        service_username = f"{svc['user_id']}_{svc['config_id']}"
+
+    product_label = _service_product_label(svc["product_key"])
+
+    if stats:
+        is_active = stats.get("is_active")
+        if is_active is True:
+            status_text = "فعال ✅"
+        elif is_active is False:
+            status_text = "غیرفعال ❌"
+        else:
+            status_text = "نامشخص ❔"
+        usage = stats.get("usage") or "نامشخص"
+        remaining = stats.get("remaining") or "نامشخص"
+        expiry = stats.get("expiry") or "نامشخص"
+        last_online = stats.get("last_online") or "متصل نشده"
+    else:
+        status_text = "نامشخص ❔ (خطا در دریافت اطلاعات از سرور)"
+        usage = "نامشخص"
+        remaining = "نامشخص"
+        expiry = "نامشخص"
+        last_online = "متصل نشده"
+
+    return (
+        "📄 <b>جزئیات سرویس</b>\n"
+        "━━━━━━━━━━━━━━━\n"
+        f"📊 <b>وضعیت سرویس:</b> {status_text}\n"
+        f"👤 <b>نام سرویس:</b> <code>{escape(service_username)}</code>\n"
+        f"🌍 <b>موقعیت سرویس:</b> {SERVICE_LOCATION_LABEL}\n"
+        f"🗂 <b>نام محصول:</b> {escape(product_label)}\n"
+        "━━━━━━━━━━━━━━━\n"
+        "🔋 <b>ترافیک:</b>\n"
+        f"📥 حجم مصرفی: {escape(str(usage))}\n"
+        f"💢 حجم باقی‌مانده: {escape(str(remaining))}\n\n"
+        f"📅 <b>تاریخ اتمام:</b> {escape(str(expiry))}\n"
+        "━━━━━━━━━━━━━━━\n"
+        f"🔗 <b>لینک سرویس:</b>\n<code>{escape(svc['link'])}</code>\n\n"
+        f"📶 <b>آخرین زمان اتصال:</b> {escape(str(last_online))}\n"
+        f"🔄 <b>آخرین بروزرسانی این پیام:</b> {get_jalali_now()}"
+    )
+
+
+async def _handle_show_service(update, context, query, user_id, service_id, mark_and_answer):
+    await mark_and_answer("⏳ در حال دریافت اطلاعات...")
+
+    svc = get_user_service_by_id(service_id)
+    if not svc or svc["user_id"] != user_id:
+        await delete_message_safe(query)
+        await send_new_message(
+            update, context,
+            text="⛔️ این سرویس یافت نشد یا متعلق به شما نیست.",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("🏘 بازگشت به لیست سرویس‌ها", callback_data="my_services")]]
+            ),
+        )
+        return None
+
+    text = await _render_service_detail_text(svc)
+    await delete_message_safe(query)
+    await send_new_message(update, context, text=text, reply_markup=get_service_detail_keyboard(service_id))
     return None
 
 

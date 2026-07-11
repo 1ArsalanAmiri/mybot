@@ -280,3 +280,14 @@ def get_admin_back_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🔙 بازگشت به پنل", callback_data="admin_panel")]
     ])
+
+
+# ---------------------------------------------------------------------------
+# سرویس‌های کاربر
+# ---------------------------------------------------------------------------
+
+def get_service_detail_keyboard(service_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("♻️ بروزرسانی اطلاعات", callback_data=f"svcrefresh_{service_id}")],
+        [InlineKeyboardButton("🏘 بازگشت به لیست سرویس‌ها", callback_data="my_services")],
+    ])

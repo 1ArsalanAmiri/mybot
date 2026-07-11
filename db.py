@@ -393,3 +393,43 @@ def get_all_user_ids() -> List[int]:
         c = conn.cursor()
         c.execute("SELECT user_id FROM users")
         return [row[0] for row in c.fetchall()]
+
+
+# ---------------------------------------------------------------------------
+# سرویس‌های فعال کاربر (برای بخش «سرویس‌های من» در منوی کاربر)
+# ---------------------------------------------------------------------------
+
+def get_services_by_user(user_id: int) -> List[dict]:
+    with sqlite3.connect(DB_PATH) as conn:
+        c = conn.cursor()
+        c.execute(
+            """
+            SELECT id, user_id, username, service_type, product_key, config_id, link,
+                   size, duration_days, start_date, expiry_date, remaining_volume, status
+            FROM user_services
+            WHERE user_id = ?
+            ORDER BY id DESC
+            """,
+            (user_id,),
+        )
+        columns = [col[0] for col in c.description]
+        return [dict(zip(columns, row)) for row in c.fetchall()]
+
+
+def get_user_service_by_id(service_id: int) -> Optional[dict]:
+    with sqlite3.connect(DB_PATH) as conn:
+        c = conn.cursor()
+        c.execute(
+            """
+            SELECT id, user_id, username, service_type, product_key, config_id, link,
+                   size, duration_days, start_date, expiry_date, remaining_volume, status
+            FROM user_services
+            WHERE id = ?
+            """,
+            (service_id,),
+        )
+        row = c.fetchone()
+        if not row:
+            return None
+        columns = [col[0] for col in c.description]
+        return dict(zip(columns, row))

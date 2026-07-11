@@ -1,9 +1,11 @@
-from html import escape
-from typing import Any, Optional
+from html import escape, unescape
+from typing import Any, Dict, Optional
 
 import jdatetime
 import io
+import re
 import random
+import httpx
 import qrcode
 from qrcode.image.styledpil import StyledPilImage
 from qrcode.image.styles.moduledrawers import RoundedModuleDrawer
@@ -368,3 +370,121 @@ async def notify_admin_service_delivered(
         f"📌 <b>وضعیت:</b> تحویل موفق"
     )
     await log_admin_event(context, "تحویل موفق سرویس", details)
+
+
+# ---------------------------------------------------------------------------
+# دریافت وضعیت لحظه‌ای سرویس از روی لینک اشتراک (صفحه‌ی Subscription Info پنل)
+# ---------------------------------------------------------------------------
+
+_SUB_INFO_LABELS = [
+    "Subscription ID",
+    "Email",
+    "Status",
+    "Downloaded",
+    "Uploaded",
+    "Usage",
+    "Total quota",
+    "Remaining",
+    "Last Online",
+    "Expiry",
+]
+
+_TAG_RE = re.compile(r"<[^>]+>")
+_SCRIPT_STYLE_RE = re.compile(r"<(script|style)[^>]*>.*?</\1>", re.IGNORECASE | re.DOTALL)
+
+
+def _html_to_lines(html: str) -> list:
+    """صفحه HTML را به یک لیست از خط‌های متنی قابل‌خواندن تبدیل می‌کند."""
+    cleaned = _SCRIPT_STYLE_RE.sub(" ", html)
+    cleaned = _TAG_RE.sub("\n", cleaned)
+    cleaned = unescape(cleaned)
+    lines = [ln.strip() for ln in cleaned.splitlines()]
+    return [ln for ln in lines if ln]
+
+
+def _pair_labeled_values(lines: list) -> Dict[str, str]:
+    """خط‌های متنی صفحه را بر اساس برچسب‌های شناخته‌شده جفت (برچسب -> مقدار) می‌کند."""
+    result: Dict[str, str] = {}
+    n = len(lines)
+    for i, line in enumerate(lines):
+        for label in _SUB_INFO_LABELS:
+            if label in result:
+                continue
+            if line == label or line.lower() == label.lower():
+                if i + 1 < n and lines[i + 1] not in _SUB_INFO_LABELS:
+                    result[label] = lines[i + 1]
+                break
+            if line.lower().startswith(label.lower()) and line != label:
+                rest = line[len(label):].strip(" \t:：-")
+                if rest:
+                    result[label] = rest
+                break
+    return result
+
+
+def _parse_userinfo_header(header_value: str) -> Dict[str, str]:
+    """پارس هدر استاندارد Subscription-Userinfo (upload=..; download=..; total=..; expire=..)."""
+    data = {}
+    for part in header_value.split(";"):
+        part = part.strip()
+        if "=" in part:
+            key, _, value = part.partition("=")
+            data[key.strip().lower()] = value.strip()
+    return data
+
+
+async def fetch_subscription_stats(link: str) -> Optional[Dict[str, Any]]:
+    """
+    اطلاعات لحظه‌ای مصرف را از روی لینک اشتراک سرویس می‌خواند (همون صفحه‌ای که
+    با باز کردن لینک در مرورگر دیده می‌شه). اگر پنل هدر استاندارد
+    Subscription-Userinfo را هم بفرستد، به‌عنوان منبع کمکی/پشتیبان استفاده می‌شه.
+    در صورت هر گونه خطا (قطعی سرور، تغییر قالب صفحه و ...) مقدار None برمی‌گردد
+    و بخش فراخوان باید با نمایش «نامشخص» با آن کنار بیاید.
+    """
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0, verify=False, follow_redirects=True) as client:
+            resp = await client.get(link, headers=headers)
+    except httpx.HTTPError as e:
+        print(f"fetch_subscription_stats error for {link}: {e}")
+        return None
+
+    if resp.status_code != 200:
+        print(f"fetch_subscription_stats: HTTP {resp.status_code} for {link}")
+        return None
+
+    parsed = _pair_labeled_values(_html_to_lines(resp.text))
+
+    userinfo_header = resp.headers.get("subscription-userinfo") or resp.headers.get("Subscription-Userinfo")
+    header_info = _parse_userinfo_header(userinfo_header) if userinfo_header else {}
+
+    status_raw = parsed.get("Status", "")
+    is_active = status_raw.strip().lower() == "active" if status_raw else None
+
+    result = {
+        "email": parsed.get("Email"),
+        "status_raw": status_raw or None,
+        "is_active": is_active,
+        "downloaded": parsed.get("Downloaded"),
+        "uploaded": parsed.get("Uploaded"),
+        "usage": parsed.get("Usage"),
+        "total_quota": parsed.get("Total quota"),
+        "remaining": parsed.get("Remaining"),
+        "last_online": parsed.get("Last Online"),
+        "expiry": parsed.get("Expiry"),
+        "header_info": header_info,
+    }
+
+    if not any(v for k, v in result.items() if k not in ("header_info", "is_active")):
+        # هیچ کدام از برچسب‌های شناخته‌شده پیدا نشدن؛ یعنی این صفحه اصلاً همون
+        # قالب مورد انتظار نیست (مثلاً پنل عوض شده یا لینک نامعتبره)
+        return None
+
+    return result
