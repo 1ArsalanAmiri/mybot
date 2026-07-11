@@ -389,6 +389,18 @@ _SUB_INFO_LABELS = [
     "Expiry",
 ]
 
+# برچسب‌های احتمالی برای اطلاعات کلاینت متصل‌شده (اکثر پنل‌ها این را نمایش نمی‌دهند،
+# پس این فقط یک تلاش «best effort» است و در صورت نبود، مقدار پیش‌فرض نمایش داده می‌شود)
+_CLIENT_INFO_LABELS = [
+    "Client",
+    "User Agent",
+    "User-Agent",
+    "Last User Agent",
+    "Last Client",
+    "App",
+    "Device",
+]
+
 _TAG_RE = re.compile(r"<[^>]+>")
 _SCRIPT_STYLE_RE = re.compile(r"<(script|style)[^>]*>.*?</\1>", re.IGNORECASE | re.DOTALL)
 
@@ -402,16 +414,18 @@ def _html_to_lines(html: str) -> list:
     return [ln for ln in lines if ln]
 
 
-def _pair_labeled_values(lines: list) -> Dict[str, str]:
+def _pair_labeled_values(lines: list, labels: Optional[list] = None) -> Dict[str, str]:
     """خط‌های متنی صفحه را بر اساس برچسب‌های شناخته‌شده جفت (برچسب -> مقدار) می‌کند."""
+    labels = labels if labels is not None else _SUB_INFO_LABELS
+    all_known = _SUB_INFO_LABELS + _CLIENT_INFO_LABELS
     result: Dict[str, str] = {}
     n = len(lines)
     for i, line in enumerate(lines):
-        for label in _SUB_INFO_LABELS:
+        for label in labels:
             if label in result:
                 continue
             if line == label or line.lower() == label.lower():
-                if i + 1 < n and lines[i + 1] not in _SUB_INFO_LABELS:
+                if i + 1 < n and lines[i + 1] not in all_known:
                     result[label] = lines[i + 1]
                 break
             if line.lower().startswith(label.lower()) and line != label:
@@ -420,6 +434,19 @@ def _pair_labeled_values(lines: list) -> Dict[str, str]:
                     result[label] = rest
                 break
     return result
+
+
+def _quota_looks_exhausted(value: Optional[str]) -> bool:
+    """تشخیص می‌دهد آیا مقدار باقی‌مانده عملاً صفر است (مثلاً '0B'، '0.00 MB'، '0')."""
+    if not value:
+        return False
+    match = re.match(r"^\s*([\d.]+)", value)
+    if not match:
+        return False
+    try:
+        return float(match.group(1)) <= 0
+    except ValueError:
+        return False
 
 
 def _parse_userinfo_header(header_value: str) -> Dict[str, str]:
@@ -460,13 +487,23 @@ async def fetch_subscription_stats(link: str) -> Optional[Dict[str, Any]]:
         print(f"fetch_subscription_stats: HTTP {resp.status_code} for {link}")
         return None
 
-    parsed = _pair_labeled_values(_html_to_lines(resp.text))
+    parsed = _pair_labeled_values(_html_to_lines(resp.text), labels=_SUB_INFO_LABELS)
+    client_parsed = _pair_labeled_values(_html_to_lines(resp.text), labels=_CLIENT_INFO_LABELS)
+    client_info = next((v for v in client_parsed.values() if v), None)
 
     userinfo_header = resp.headers.get("subscription-userinfo") or resp.headers.get("Subscription-Userinfo")
     header_info = _parse_userinfo_header(userinfo_header) if userinfo_header else {}
 
     status_raw = parsed.get("Status", "")
-    is_active = status_raw.strip().lower() == "active" if status_raw else None
+    status_active = status_raw.strip().lower() == "active" if status_raw else None
+
+    remaining = parsed.get("Remaining")
+    quota_exhausted = _quota_looks_exhausted(remaining)
+
+    if status_active is None:
+        is_active = None
+    else:
+        is_active = status_active and not quota_exhausted
 
     result = {
         "email": parsed.get("Email"),
@@ -476,13 +513,14 @@ async def fetch_subscription_stats(link: str) -> Optional[Dict[str, Any]]:
         "uploaded": parsed.get("Uploaded"),
         "usage": parsed.get("Usage"),
         "total_quota": parsed.get("Total quota"),
-        "remaining": parsed.get("Remaining"),
+        "remaining": remaining,
         "last_online": parsed.get("Last Online"),
         "expiry": parsed.get("Expiry"),
+        "client_info": client_info,
         "header_info": header_info,
     }
 
-    if not any(v for k, v in result.items() if k not in ("header_info", "is_active")):
+    if not any(v for k, v in result.items() if k not in ("header_info", "is_active", "client_info")):
         # هیچ کدام از برچسب‌های شناخته‌شده پیدا نشدن؛ یعنی این صفحه اصلاً همون
         # قالب مورد انتظار نیست (مثلاً پنل عوض شده یا لینک نامعتبره)
         return None

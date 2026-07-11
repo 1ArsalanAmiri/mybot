@@ -1177,7 +1177,7 @@ async def _handle_test_account(update, context, query, user, user_id, mark_and_a
     return None
 
 
-SERVICE_LOCATION_LABEL = "Netherlands 🇳🇱"
+SERVICE_LOCATION_LABEL = "France 🇫🇷"
 
 
 async def _handle_my_services(update, context, query, user_id):
@@ -1221,12 +1221,14 @@ async def _render_service_detail_text(svc: dict) -> str:
         remaining = stats.get("remaining") or "نامشخص"
         expiry = stats.get("expiry") or "نامشخص"
         last_online = stats.get("last_online") or "متصل نشده"
+        client_info = stats.get("client_info") or "نامشخص"
     else:
         status_text = "نامشخص ❔ (خطا در دریافت اطلاعات از سرور)"
         usage = "نامشخص"
         remaining = "نامشخص"
         expiry = "نامشخص"
         last_online = "متصل نشده"
+        client_info = "نامشخص"
 
     return (
         "📄 <b>جزئیات سرویس</b>\n"
@@ -1243,7 +1245,8 @@ async def _render_service_detail_text(svc: dict) -> str:
         "━━━━━━━━━━━━━━━\n"
         f"🔗 <b>لینک سرویس:</b>\n<code>{escape(svc['link'])}</code>\n\n"
         f"📶 <b>آخرین زمان اتصال:</b> {escape(str(last_online))}\n"
-        f"🔄 <b>آخرین بروزرسانی این پیام:</b> {get_jalali_now()}"
+        f"🔄 <b>آخرین زمان آپدیت لینک اشتراک:</b> {get_jalali_now()}\n"
+        f"#️⃣ <b>کلاینت متصل شده:</b> {escape(str(client_info))}"
     )
 
 
