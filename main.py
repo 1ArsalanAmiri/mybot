@@ -28,6 +28,7 @@ from handlers import (
     admin_help,
     admin_panel,
     admin_cancel,
+    admin_xui_debug,
 )
 import logging
 
@@ -77,6 +78,7 @@ def main():
     app.add_handler(CommandHandler("adminhelp", admin_help))
     app.add_handler(CommandHandler("helpadmin", admin_help))
     app.add_handler(CommandHandler("cancel", admin_cancel))
+    app.add_handler(CommandHandler("xuidebug", admin_xui_debug))
     app.add_handler(receipt_conv_handler)
     app.add_handler(topup_conv_handler)
     app.add_handler(CallbackQueryHandler(button_handler))

@@ -1,5 +1,8 @@
 from html import escape
+import asyncio
+import logging
 import os
+from typing import Optional
 
 import jdatetime
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, LabeledPrice
@@ -16,7 +19,7 @@ from db import (
     get_order_by_id, update_order_status,
     add_user_balance, mark_config_sold,
     create_user_service, get_user_services_list, count_active_user_services,
-    get_all_user_ids, get_services_by_user, get_user_service_by_id,
+    get_all_user_ids, get_services_by_user, get_user_service_by_id, set_service_xui_email,
 )
 from utils import (
     build_order_text,
@@ -36,8 +39,8 @@ from utils import (
     notify_admin_service_delivered,
     get_jalali_now,
     generate_qr_code,
-    fetch_subscription_stats,
 )
+import xui_db
 from keyboads import (
     get_main_menu_keyboard, get_wallet_keyboard, get_support_keyboard, get_products_keyboard,
     DURATION_CODE_TO_DAYS, get_duration_menu_keyboard, get_payment_method_keyboard, PRODUCTS,
@@ -55,6 +58,8 @@ from keyboads import (
 WAITING_FOR_RECEIPT = 1
 WAITING_FOR_TOPUP_AMOUNT = 2
 WAITING_FOR_BROADCAST = 3
+
+logger = logging.getLogger("handlers")
 
 ALLOWED_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
 USERS_PER_PAGE = 5
@@ -556,6 +561,11 @@ def _admin_help_text() -> str:
         "• خرید با Telegram Stars\n"
         "• افزایش موجودی با Stars\n"
         "• تحویل موفق سرویس\n\n"
+        "<b>🧪 دیباگ اتصال به x-ui</b>\n"
+        "• <code>/xuidebug</code> — نمایش جدول‌های موجود در دیتابیس x-ui\n"
+        "• <code>/xuidebug email فلان@ایمیل</code> — تست خواندن یک کلاینت با ایمیل\n"
+        "• <code>/xuidebug subid فلان‌ساب‌آیدی</code> — تست خواندن یک کلاینت با subId\n"
+        "• <code>/xuidebug link https://.../sub/xxxx</code> — تست کامل با یک لینک subscription\n\n"
         "• <code>/helpadmin</code> — نمایش همین راهنما"
     )
 
@@ -565,6 +575,95 @@ async def admin_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not user or not is_admin(user.id):
         return
     await update.message.reply_text(_admin_help_text(), parse_mode="HTML")
+
+
+async def admin_xui_debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    دستور دیباگ برای تست مستقیم اتصال به x-ui.db روی سرور واقعی، بدون نیاز
+    به دست‌کاری کد. چون این ماژول فقط SELECT انجام می‌دهد، اجرای این دستور
+    کاملاً امن است و چیزی در x-ui تغییر نمی‌دهد.
+
+    استفاده:
+        /xuidebug                        -> لیست جدول‌های دیتابیس x-ui
+        /xuidebug email user@example.com -> get_client_info با ایمیل
+        /xuidebug subid rtxu6ex39kqesbru -> پیدا کردن ایمیل از روی subId و بعد get_client_info
+        /xuidebug link https://host:2096/sub/rtxu6ex39kqesbru -> استخراج subId از لینک کامل
+    """
+    user = update.effective_user
+    if not user or not is_admin(user.id):
+        return
+
+    args = context.args
+    if not args:
+        tables = await asyncio.to_thread(xui_db.list_tables)
+        text = (
+            f"🗄 <b>مسیر دیتابیس:</b> <code>{escape(xui_db.XUI_DB_PATH)}</code>\n\n"
+            f"📋 <b>جدول‌های موجود ({len(tables)}):</b>\n"
+            + ("\n".join(f"• <code>{escape(t)}</code>" for t in tables) if tables else "❌ هیچ جدولی خوانده نشد (مسیر یا دسترسی فایل را بررسی کن).")
+        )
+        await update.message.reply_text(text, parse_mode="HTML")
+        return
+
+    mode = args[0].strip().lower()
+    value = " ".join(args[1:]).strip()
+
+    if mode not in ("email", "subid", "link") or not value:
+        await update.message.reply_text(
+            "❌ فرمت درست:\n"
+            "<code>/xuidebug email user@example.com</code>\n"
+            "<code>/xuidebug subid rtxu6ex39kqesbru</code>\n"
+            "<code>/xuidebug link https://host:2096/sub/xxxx</code>",
+            parse_mode="HTML",
+        )
+        return
+
+    if mode == "link":
+        sub_id = xui_db.extract_subid_from_link(value)
+        if not sub_id:
+            await update.message.reply_text("❌ نتونستم subId رو از این لینک استخراج کنم.")
+            return
+        email = await asyncio.to_thread(xui_db.find_email_by_subid, sub_id)
+    elif mode == "subid":
+        sub_id = value
+        email = await asyncio.to_thread(xui_db.find_email_by_subid, sub_id)
+    else:
+        sub_id = None
+        email = value
+
+    if not email:
+        await update.message.reply_text(
+            f"❌ کلاینتی پیدا نشد (subId: <code>{escape(sub_id or '-')}</code>).\n"
+            "جزئیات خطا در لاگ ربات (stderr) ثبت شده.",
+            parse_mode="HTML",
+        )
+        return
+
+    info = await asyncio.to_thread(xui_db.get_client_info, email)
+    if not info:
+        await update.message.reply_text(
+            f"❌ ایمیل <code>{escape(email)}</code> پیدا شد ولی get_client_info چیزی برنگردوند.",
+            parse_mode="HTML",
+        )
+        return
+
+    active = xui_db.is_active(info)
+    usage_bytes = int(info.get("up") or 0) + int(info.get("down") or 0)
+    total = int(info.get("total") or 0)
+    remaining = "نامحدود" if total <= 0 else xui_db.format_bytes(max(total - usage_bytes, 0))
+
+    text = (
+        "🧪 <b>نتیجه دیباگ x-ui</b>\n"
+        f"📧 ایمیل: <code>{escape(str(info.get('email')))}</code>\n"
+        f"🆔 subId: <code>{escape(str(info.get('sub_id')))}</code>\n"
+        f"🔑 UUID/Password: <code>{escape(str(info.get('uuid')))}</code>\n"
+        f"📡 Inbound: <code>{escape(str(info.get('inbound_remark')))}</code> ({escape(str(info.get('inbound_protocol')))})\n"
+        f"✅ enable: {info.get('enable')}\n"
+        f"📊 وضعیت محاسبه‌شده: {'فعال ✅' if active else 'غیرفعال ❌'}\n"
+        f"📥 مصرف: {xui_db.format_bytes(usage_bytes)}\n"
+        f"💢 باقی‌مانده: {remaining}\n"
+        f"📅 انقضا: {xui_db.format_expiry(info.get('expiry_time'))}\n"
+    )
+    await update.message.reply_text(text, parse_mode="HTML")
 
 
 # ---------------------------------------------------------------------------
@@ -1199,9 +1298,40 @@ async def _handle_my_services(update, context, query, user_id):
     return None
 
 
-async def _render_service_detail_text(svc: dict) -> str:
-    stats = await fetch_subscription_stats(svc["link"])
+async def _resolve_xui_email(svc: dict) -> Optional[str]:
+    """
+    ایمیل کلاینت متناظر این سرویس را در x-ui پیدا می‌کند.
+    اول ستون کش‌شده (xui_email) را نگاه می‌کند؛ اگر خالی بود، از روی subId
+    توی لینک subscription جستجو می‌کند و نتیجه را برای دفعات بعد کش می‌کند.
+    """
+    cached = svc.get("xui_email")
+    if cached:
+        return cached
 
+    sub_id = xui_db.extract_subid_from_link(svc.get("link"))
+    if not sub_id:
+        logger.warning(
+            "Cannot extract subId from service link (service_id=%s): %r",
+            svc.get("id"), svc.get("link"),
+        )
+        return None
+
+    email = await asyncio.to_thread(xui_db.find_email_by_subid, sub_id)
+    if email:
+        try:
+            set_service_xui_email(svc["id"], email)
+        except Exception as e:
+            logger.error(
+                "Failed to cache xui_email for service %s: %s", svc.get("id"), e, exc_info=True
+            )
+    else:
+        logger.warning(
+            "No x-ui client found for subId=%s (service_id=%s)", sub_id, svc.get("id")
+        )
+    return email
+
+
+async def _render_service_detail_text(svc: dict) -> str:
     if svc["service_type"] == "test":
         service_username = f"{svc['user_id']}_test"
     else:
@@ -1209,25 +1339,32 @@ async def _render_service_detail_text(svc: dict) -> str:
 
     product_label = _service_product_label(svc["product_key"])
 
-    if stats:
-        is_active = stats.get("is_active")
-        if is_active is True:
-            status_text = "فعال ✅"
-        elif is_active is False:
-            status_text = "غیرفعال ❌"
-        else:
-            status_text = "نامشخص ❔"
-        usage = stats.get("usage") or "نامشخص"
-        remaining = stats.get("remaining") or "نامشخص"
-        expiry = stats.get("expiry") or "نامشخص"
-        last_online = stats.get("last_online") or "متصل نشده"
-        client_info = stats.get("client_info") or "نامشخص"
+    email = await _resolve_xui_email(svc)
+    info = await asyncio.to_thread(xui_db.get_client_info, email) if email else None
+
+    if info:
+        is_active = xui_db.is_active(info)
+        status_text = "فعال ✅" if is_active else "غیرفعال ❌"
+
+        up = int(info.get("up") or 0)
+        down = int(info.get("down") or 0)
+        total = int(info.get("total") or 0)
+        usage_bytes = up + down
+        usage = xui_db.format_bytes(usage_bytes)
+        remaining = (
+            "نامحدود ♾" if total <= 0 else xui_db.format_bytes(max(total - usage_bytes, 0))
+        )
+        expiry = xui_db.format_expiry(info.get("expiry_time"))
+        # این دو مقدار در دیتابیس x-ui اصلاً ذخیره نمی‌شوند (نیاز به gRPC API
+        # زنده‌ی Xray یا access.log دارند)، پس صادقانه «نامشخص» نمایش می‌دهیم.
+        last_online = "نامشخص"
+        client_info = "نامشخص"
     else:
-        status_text = "نامشخص ❔ (خطا در دریافت اطلاعات از سرور)"
+        status_text = "نامشخص ❔ (کلاینت در دیتابیس x-ui پیدا نشد)"
         usage = "نامشخص"
         remaining = "نامشخص"
         expiry = "نامشخص"
-        last_online = "متصل نشده"
+        last_online = "نامشخص"
         client_info = "نامشخص"
 
     return (
@@ -1245,7 +1382,7 @@ async def _render_service_detail_text(svc: dict) -> str:
         "━━━━━━━━━━━━━━━\n"
         f"🔗 <b>لینک سرویس:</b>\n<code>{escape(svc['link'])}</code>\n\n"
         f"📶 <b>آخرین زمان اتصال:</b> {escape(str(last_online))}\n"
-        f"🔄 <b>آخرین زمان آپدیت لینک اشتراک:</b> {get_jalali_now()}\n"
+        f"🔄 <b>آخرین بروزرسانی:</b> {get_jalali_now()}\n"
         f"#️⃣ <b>کلاینت متصل شده:</b> {escape(str(client_info))}"
     )
 

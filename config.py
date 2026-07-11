@@ -12,3 +12,6 @@ TRANSACTION_LOG_CHANNEL_ID = int(os.getenv("TRANSACTION_LOG_CHANNEL_ID", "-10044
 TOMAN_PER_STAR = int(os.getenv("TOMAN_PER_STAR", "2000"))
 
 DB_PATH = os.getenv("DB_PATH", "bot_database.db")
+
+# مسیر دیتابیس پنل x-ui (فقط خوانده می‌شود، هیچ‌وقت نوشته نمی‌شود — نگاه کن به xui_db.py)
+XUI_DB_PATH = os.getenv("XUI_DB_PATH", "/etc/x-ui/x-ui.db")

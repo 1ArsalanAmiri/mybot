@@ -6,6 +6,11 @@ import jdatetime
 from config import DB_PATH
 
 
+def _column_exists(conn: sqlite3.Connection, table: str, column: str) -> bool:
+    cur = conn.execute(f"PRAGMA table_info({table})")
+    return any(row[1] == column for row in cur.fetchall())
+
+
 def init_db() -> None:
     with sqlite3.connect(DB_PATH) as conn:
         c = conn.cursor()
@@ -63,10 +68,18 @@ def init_db() -> None:
                 expiry_date TEXT,
                 remaining_volume TEXT,
                 status TEXT DEFAULT 'active',
+                xui_email TEXT,
                 FOREIGN KEY(user_id) REFERENCES users(user_id)
             )
             """
         )
+
+        # مهاجرت برای دیتابیس‌های قدیمی‌تر که ستون xui_email را ندارند
+        # (این ستون کش ایمیل کلاینت x-ui است تا لازم نباشه هر بار همه‌ی
+        # inbound ها را برای پیدا کردن subId اسکن کنیم)
+        if not _column_exists(conn, "user_services", "xui_email"):
+            c.execute("ALTER TABLE user_services ADD COLUMN xui_email TEXT")
+
         conn.commit()
 
 
@@ -405,7 +418,8 @@ def get_services_by_user(user_id: int) -> List[dict]:
         c.execute(
             """
             SELECT id, user_id, username, service_type, product_key, config_id, link,
-                   size, duration_days, start_date, expiry_date, remaining_volume, status
+                   size, duration_days, start_date, expiry_date, remaining_volume, status,
+                   xui_email
             FROM user_services
             WHERE user_id = ?
             ORDER BY id DESC
@@ -422,7 +436,8 @@ def get_user_service_by_id(service_id: int) -> Optional[dict]:
         c.execute(
             """
             SELECT id, user_id, username, service_type, product_key, config_id, link,
-                   size, duration_days, start_date, expiry_date, remaining_volume, status
+                   size, duration_days, start_date, expiry_date, remaining_volume, status,
+                   xui_email
             FROM user_services
             WHERE id = ?
             """,
@@ -433,3 +448,14 @@ def get_user_service_by_id(service_id: int) -> Optional[dict]:
             return None
         columns = [col[0] for col in c.description]
         return dict(zip(columns, row))
+
+
+def set_service_xui_email(service_id: int, email: str) -> None:
+    """
+    ایمیل کلاینت x-ui را برای یک سرویس کش می‌کند تا دفعات بعد لازم نباشد
+    دوباره کل inbound ها برای پیدا کردن subId اسکن شوند.
+    """
+    with sqlite3.connect(DB_PATH) as conn:
+        c = conn.cursor()
+        c.execute("UPDATE user_services SET xui_email = ? WHERE id = ?", (email, service_id))
+        conn.commit()
