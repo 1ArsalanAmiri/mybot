@@ -344,7 +344,10 @@ def create_client(
     ``days`` می‌تواند اعشاری باشد (مثلاً 1 روز = 24 ساعت؛ برای تست ساعتی از
     days = hours/24 استفاده کن). ``volume_gb`` صفر یعنی نامحدود.
     """
-    inbound_id = XRAY_INBOUND_ID
+    inbound_id = resolve_inbound_id(
+        purpose,
+        product_key
+    )
     inbound_raw = _get_inbound_raw(inbound_id)
     protocol = inbound_raw.get("protocol", "vless")
     security = _inbound_stream_security(inbound_raw)
@@ -358,8 +361,11 @@ def create_client(
     )
 
     _api_post(
-        "panel/api/inbounds/addClient",
-        {"id": inbound_id, "settings": json.dumps({"clients": [client_obj]})},
+        "panel/api/clients/add",
+        {
+            "client": client_obj,
+            "inboundIds": [inbound_id]
+        },
     )
 
     link = xui_db.build_subscription_link(sub_id)
