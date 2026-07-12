@@ -2643,7 +2643,7 @@ async def debug_get_chat_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await admin_ticket_reply_handler(update, context)
             return
 
-    if context.user_data.get("awaiting_ticket_message"):
+    if context.user_data and context.user_data.get("awaiting_ticket_message"):
         await ticket_message_handler(update, context)
         return
 
