@@ -68,18 +68,24 @@ def _get_session() -> requests.Session:
     session = requests.Session()
     try:
         resp = session.post(
-            _base_url() + "login",
-            data={"username": XUI_PANEL_USERNAME, "password": XUI_PANEL_PASSWORD},
+            _base_url() + "panel/api/login",
+            json={
+                "username": XUI_PANEL_USERNAME,
+                "password": XUI_PANEL_PASSWORD
+            },
             timeout=15,
             verify=True,
         )
     except requests.exceptions.SSLError:
         # برخی پنل‌ها با گواهی self-signed اجرا می‌شوند
         resp = session.post(
-            _base_url() + "login",
-            data={"username": XUI_PANEL_USERNAME, "password": XUI_PANEL_PASSWORD},
+            _base_url() + "panel/api/login",
+            json={
+                "username": XUI_PANEL_USERNAME,
+                "password": XUI_PANEL_PASSWORD
+            },
             timeout=15,
-            verify=False,
+            verify=True,
         )
     except requests.RequestException as e:
         raise XUIAPIError(f"اتصال به پنل x-ui برای لاگین برقرار نشد: {e}") from e

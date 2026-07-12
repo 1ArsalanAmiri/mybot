@@ -26,7 +26,8 @@ XUI_DB_PATH = os.getenv("XUI_DB_PATH", "/etc/x-ui/x-ui.db")
 #   ۱) پسورد ادمین پنل x-ui را همین الان از پنل عوض کنید،
 #   ۲) به‌جای هاردکد این‌ها در فایل، از Environment Variable استفاده کنید.
 # ---------------------------------------------------------------------------
-XUI_PANEL_URL = os.getenv("XUI_PANEL_URL", "https://d1.trapxan.ir:31904/ruABWX2VUALMAAuMsd/")
+# XUI_PANEL_URL = os.getenv("XUI_PANEL_URL", "https://d1.trapxan.ir:31904/ruABWX2VUALMAAuMsd/")
+XUI_PANEL_URL = "https://127.0.0.1:31904/ruABWX2VUALMAAuMsd/"
 XUI_PANEL_USERNAME = os.getenv("XUI_PANEL_USERNAME", "admin")
 XUI_PANEL_PASSWORD = os.getenv("XUI_PANEL_PASSWORD", "1234")
 
