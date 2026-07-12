@@ -39,6 +39,7 @@ XUI_PANEL_PASSWORD = os.getenv("XUI_PANEL_PASSWORD", "1234")
 # اینجا بگذارید (همان id ستون اول جدول inbounds).
 # ---------------------------------------------------------------------------
 TEST_ACCOUNT_INBOUND_ID = os.getenv("TEST_ACCOUNT_INBOUND_ID")
+XRAY_INBOUND_ID = 1
 TEST_ACCOUNT_INBOUND_ID = int(TEST_ACCOUNT_INBOUND_ID) if TEST_ACCOUNT_INBOUND_ID else None
 
 REFERRAL_GIFT_INBOUND_ID = os.getenv("REFERRAL_GIFT_INBOUND_ID")

@@ -37,7 +37,7 @@ from config import (
     XUI_PANEL_PASSWORD,
     TEST_ACCOUNT_INBOUND_ID,
     REFERRAL_GIFT_INBOUND_ID,
-    PRODUCT_INBOUND_MAP,
+    PRODUCT_INBOUND_MAP, XRAY_INBOUND_ID,
 )
 import xui_db
 
@@ -78,8 +78,6 @@ def _get_session() -> requests.Session:
             timeout=15,
             verify=False
         )
-        print("LOGIN PAGE STATUS:", page.status_code)
-        print(page.text[:500])
 
         csrf_match = re.search(
             r'name="csrf-token" content="([^"]+)"',
@@ -106,8 +104,6 @@ def _get_session() -> requests.Session:
             timeout=15,
             verify=False
         )
-        print("LOGIN PAGE STATUS:", page.status_code)
-        print(page.text[:500])
 
 
     except requests.RequestException as e:
@@ -309,12 +305,20 @@ def _build_client_object(
     return client, sub_id
 
 
-def _inbound_stream_security(inbound_raw: dict) -> Optional[str]:
+def _inbound_stream_security(inbound_raw):
     try:
         stream = json.loads(inbound_raw.get("streamSettings") or "{}")
-        return stream.get("security")
-    except (json.JSONDecodeError, TypeError):
-        return None
+
+        if stream.get("security"):
+            return stream["security"]
+
+        if stream.get("realitySettings"):
+            return "reality"
+
+    except:
+        pass
+
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -340,7 +344,7 @@ def create_client(
     ``days`` می‌تواند اعشاری باشد (مثلاً 1 روز = 24 ساعت؛ برای تست ساعتی از
     days = hours/24 استفاده کن). ``volume_gb`` صفر یعنی نامحدود.
     """
-    inbound_id = resolve_inbound_id(purpose, product_key=product_key)
+    inbound_id = XRAY_INBOUND_ID
     inbound_raw = _get_inbound_raw(inbound_id)
     protocol = inbound_raw.get("protocol", "vless")
     security = _inbound_stream_security(inbound_raw)
