@@ -25,7 +25,9 @@ import secrets
 import string
 import time
 import uuid
+import re
 from typing import Any, Dict, List, Optional
+
 
 import requests
 
@@ -61,45 +63,79 @@ def _base_url() -> str:
 
 def _get_session() -> requests.Session:
     global _session, _session_created_at
+
     now = time.time()
+
     if _session is not None and (now - _session_created_at) < _SESSION_TTL_SECONDS:
         return _session
 
     session = requests.Session()
+
     try:
+        # گرفتن صفحه login برای CSRF
+        page = session.get(
+            _base_url(),
+            timeout=15,
+            verify=False
+        )
+        print("LOGIN PAGE STATUS:", page.status_code)
+        print(page.text[:500])
+
+        csrf_match = re.search(
+            r'name="csrf-token" content="([^"]+)"',
+            page.text
+        )
+
+        headers = {
+            "Content-Type": "application/json",
+            "X-Requested-With": "XMLHttpRequest",
+        }
+
+        if csrf_match:
+            headers["X-CSRF-Token"] = csrf_match.group(1)
+
+
         resp = session.post(
-            _base_url() + "panel/api/login",
+            _base_url() + "login",
             json={
                 "username": XUI_PANEL_USERNAME,
-                "password": XUI_PANEL_PASSWORD
+                "password": XUI_PANEL_PASSWORD,
+                "twoFactorCode": ""
             },
+            headers=headers,
             timeout=15,
-            verify=True,
+            verify=False
         )
-    except requests.exceptions.SSLError:
-        # برخی پنل‌ها با گواهی self-signed اجرا می‌شوند
-        resp = session.post(
-            _base_url() + "panel/api/login",
-            json={
-                "username": XUI_PANEL_USERNAME,
-                "password": XUI_PANEL_PASSWORD
-            },
-            timeout=15,
-            verify=True,
-        )
+        print("LOGIN PAGE STATUS:", page.status_code)
+        print(page.text[:500])
+
+
     except requests.RequestException as e:
-        raise XUIAPIError(f"اتصال به پنل x-ui برای لاگین برقرار نشد: {e}") from e
+        raise XUIAPIError(
+            f"اتصال به پنل x-ui برقرار نشد: {e}"
+        )
+
 
     try:
         data = resp.json()
+
     except ValueError:
-        raise XUIAPIError(f"پاسخ لاگین پنل JSON نبود (status={resp.status_code}). آدرس پنل را بررسی کن.")
+        raise XUIAPIError(
+            f"پاسخ لاگین JSON نبود status={resp.status_code}: {resp.text}"
+        )
+
 
     if not data.get("success"):
-        raise XUIAPIError(f"لاگین به پنل x-ui ناموفق بود: {data.get('msg', 'نامشخص')}")
+        raise XUIAPIError(
+            f"لاگین ناموفق: {data}"
+        )
+
 
     _session = session
     _session_created_at = now
+
+    logger.info("Successfully logged into XUI panel")
+
     return session
 
 
