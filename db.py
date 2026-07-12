@@ -80,10 +80,126 @@ def init_db() -> None:
         if not _column_exists(conn, "user_services", "xui_email"):
             c.execute("ALTER TABLE user_services ADD COLUMN xui_email TEXT")
 
+        # -------------------------------------------------------------
+        # مهاجرت‌های جدید (تست خودکار / مانیتورینگ / تیکت / آمار / Referral)
+        # فقط افزودن ستون/جدول در صورت نبود؛ هیچ داده‌ی قبلی حذف/تغییر نمی‌شود.
+        # -------------------------------------------------------------
+
+        # user_services: نوع ماشین‌خوان سرویس + اطلاعات کلاینت زنده‌ی x-ui
+        if not _column_exists(conn, "user_services", "kind"):
+            c.execute("ALTER TABLE user_services ADD COLUMN kind TEXT DEFAULT 'paid'")
+        if not _column_exists(conn, "user_services", "xui_client_uuid"):
+            c.execute("ALTER TABLE user_services ADD COLUMN xui_client_uuid TEXT")
+        if not _column_exists(conn, "user_services", "xui_inbound_id"):
+            c.execute("ALTER TABLE user_services ADD COLUMN xui_inbound_id INTEGER")
+        if not _column_exists(conn, "user_services", "total_bytes"):
+            c.execute("ALTER TABLE user_services ADD COLUMN total_bytes INTEGER DEFAULT 0")
+        if not _column_exists(conn, "user_services", "expiry_ms"):
+            c.execute("ALTER TABLE user_services ADD COLUMN expiry_ms INTEGER DEFAULT 0")
+        if not _column_exists(conn, "user_services", "protocol"):
+            c.execute("ALTER TABLE user_services ADD COLUMN protocol TEXT")
+
+        # users: سیستم Referral (بخش ۶)
+        if not _column_exists(conn, "users", "invited_by"):
+            c.execute("ALTER TABLE users ADD COLUMN invited_by INTEGER")
+        if not _column_exists(conn, "users", "invite_count"):
+            c.execute("ALTER TABLE users ADD COLUMN invite_count INTEGER DEFAULT 0")
+        if not _column_exists(conn, "users", "referral_rewards_given"):
+            c.execute("ALTER TABLE users ADD COLUMN referral_rewards_given INTEGER DEFAULT 0")
+
+        # orders: نوع سفارش (برای گزارش فروش بخش ۴؛ پیش‌فرض 'purchase' سازگار با داده‌ی قبلی)
+        if not _column_exists(conn, "orders", "kind"):
+            c.execute("ALTER TABLE orders ADD COLUMN kind TEXT DEFAULT 'purchase'")
+
+        # سیستم تیکت پشتیبانی (بخش ۳)
+        c.execute(
+            """
+            CREATE TABLE IF NOT EXISTS tickets (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                username TEXT,
+                message TEXT NOT NULL,
+                admin_reply TEXT,
+                status TEXT DEFAULT 'open',
+                created_at TEXT,
+                updated_at TEXT
+            )
+            """
+        )
+
+        # لاگ دعوت‌های موفق Referral — هر invited_id فقط یک‌بار می‌تواند ثبت شود
+        # (UNIQUE روی invited_id دقیقاً همان قانون «اگر قبلاً start کرده بود حساب نشود» را تضمین می‌کند)
+        c.execute(
+            """
+            CREATE TABLE IF NOT EXISTS referrals (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                inviter_id INTEGER NOT NULL,
+                invited_id INTEGER NOT NULL UNIQUE,
+                created_at TEXT
+            )
+            """
+        )
+
+        # لاگ هدایای اعطاشده (هدیه‌ی رفرال و غیره)
+        c.execute(
+            """
+            CREATE TABLE IF NOT EXISTS rewards (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                reward_type TEXT NOT NULL,
+                service_id INTEGER,
+                created_at TEXT
+            )
+            """
+        )
+
+        # اسنپ‌شات‌های مانیتورینگ سرور (بخش ۲) — فقط برای تاریخچه؛ نمایش زنده مستقیم از psutil است
+        c.execute(
+            """
+            CREATE TABLE IF NOT EXISTS server_stats (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                cpu_percent REAL,
+                ram_percent REAL,
+                disk_percent REAL,
+                uptime_seconds INTEGER,
+                created_at TEXT
+            )
+            """
+        )
+
+        # لاگ نوتیفیکیشن‌های ادمین (کاربر جدید، هدیه‌ی رفرال، ...) — برای رهگیری/گزارش
+        c.execute(
+            """
+            CREATE TABLE IF NOT EXISTS notifications (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                type TEXT NOT NULL,
+                payload TEXT,
+                created_at TEXT
+            )
+            """
+        )
+
         conn.commit()
 
 
-def get_or_create_user(user_id: int, username: Optional[str], full_name: str) -> dict:
+def get_or_create_user(
+    user_id: int,
+    username: Optional[str],
+    full_name: str,
+    inviter_id: Optional[int] = None,
+) -> dict:
+    """
+    کاربر را برمی‌گرداند (و اگر وجود نداشت می‌سازد).
+    خروجی یک دیکشنری از ستون‌های جدول users است که یک کلید اضافه‌ی
+    ``_is_new`` هم دارد: True فقط دقیقاً همان باری که این کاربر برای اولین‌بار
+    ساخته می‌شود (برای نوتیفیکیشن «کاربر جدید» در بخش ۵ استفاده می‌شود — طبق
+    قانون «فقط اولین start، نه هر بار»).
+
+    اگر inviter_id داده شود و کاربر واقعاً برای اولین‌بار ساخته شود (و
+    inviter_id با خودِ user_id یکی نباشد، یعنی کسی نمی‌تواند خودش را دعوت
+    کند)، ستون invited_by ثبت می‌شود — پایه‌ی سیستم Referral در بخش ۶.
+    ثبت شمارش/پاداش دعوت‌کننده در جای دیگری (record_referral) انجام می‌شود.
+    """
     with sqlite3.connect(DB_PATH) as conn:
         c = conn.cursor()
         c.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
@@ -97,22 +213,51 @@ def get_or_create_user(user_id: int, username: Optional[str], full_name: str) ->
             conn.commit()
             c.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
             updated_row = c.fetchone()
-            return dict(zip([column[0] for column in c.description], updated_row))
+            result = dict(zip([column[0] for column in c.description], updated_row))
+            result["_is_new"] = False
+            return result
 
         import uuid
 
         ref_code = str(uuid.uuid4().hex)[:12]
         now = jdatetime.datetime.now().strftime("%Y/%m/%d %H:%M:%S")
 
+        valid_inviter = inviter_id if (inviter_id and inviter_id != user_id) else None
+
         c.execute(
-            "INSERT INTO users (user_id, username, full_name, balance, referral_code, join_date) VALUES (?, ?, ?, ?, ?, ?)",
-            (user_id, username, full_name, 0, ref_code, now),
+            "INSERT INTO users (user_id, username, full_name, balance, referral_code, join_date, invited_by) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (user_id, username, full_name, 0, ref_code, now, valid_inviter),
         )
         conn.commit()
 
         c.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
         new_row = c.fetchone()
-        return dict(zip([column[0] for column in c.description], new_row))
+        result = dict(zip([column[0] for column in c.description], new_row))
+        result["_is_new"] = True
+        return result
+
+
+def get_user_by_referral_code(code: str) -> Optional[dict]:
+    if not code:
+        return None
+    with sqlite3.connect(DB_PATH) as conn:
+        c = conn.cursor()
+        c.execute("SELECT * FROM users WHERE referral_code = ?", (code.strip(),))
+        row = c.fetchone()
+        if not row:
+            return None
+        return dict(zip([column[0] for column in c.description], row))
+
+
+def get_user_by_id(user_id: int) -> Optional[dict]:
+    with sqlite3.connect(DB_PATH) as conn:
+        c = conn.cursor()
+        c.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
+        row = c.fetchone()
+        if not row:
+            return None
+        return dict(zip([column[0] for column in c.description], row))
 
 
 def get_user_balance(user_id: int) -> int:
@@ -338,15 +483,31 @@ def create_user_service(
     username: Optional[str],
     service_type: str,
     product_key: str,
-    config_id: int,
+    config_id: Optional[int],
     link: str,
     size: str,
     duration_days: int,
+    kind: Optional[str] = None,
+    xui_client_uuid: Optional[str] = None,
+    xui_inbound_id: Optional[int] = None,
+    xui_email: Optional[str] = None,
+    total_bytes: int = 0,
+    expiry_ms: int = 0,
+    protocol: Optional[str] = None,
 ) -> int:
+    """
+    ``config_id`` می‌تواند None باشد (سرویس‌هایی که از استخر لینک‌های دستی
+    نیستند، بلکه زنده و خودکار در x-ui ساخته شده‌اند — تست/هدیه‌ی Referral).
+    ``kind`` نوع ماشین‌خوان سرویس است (test/paid/gift)؛ اگر داده نشود از
+    روی ``service_type`` قدیمی («test»/«paid») استنتاج می‌شود تا فراخوانی‌های
+    قبلی (پرداختی) بدون تغییر کار کنند.
+    """
     now = jdatetime.datetime.now()
     start_date = now.strftime("%Y/%m/%d %H:%M:%S")
     expiry = now + jdatetime.timedelta(days=duration_days)
     expiry_date = expiry.strftime("%Y/%m/%d %H:%M:%S")
+
+    resolved_kind = kind or ("test" if service_type == "test" else "paid")
 
     with sqlite3.connect(DB_PATH) as conn:
         c = conn.cursor()
@@ -354,8 +515,9 @@ def create_user_service(
             """
             INSERT INTO user_services
             (user_id, username, service_type, product_key, config_id, link, size,
-             duration_days, start_date, expiry_date, remaining_volume, status)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active')
+             duration_days, start_date, expiry_date, remaining_volume, status,
+             kind, xui_client_uuid, xui_inbound_id, xui_email, total_bytes, expiry_ms, protocol)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 user_id,
@@ -369,6 +531,13 @@ def create_user_service(
                 start_date,
                 expiry_date,
                 size,
+                resolved_kind,
+                xui_client_uuid,
+                xui_inbound_id,
+                xui_email,
+                total_bytes,
+                expiry_ms,
+                protocol,
             ),
         )
         conn.commit()
@@ -459,3 +628,363 @@ def set_service_xui_email(service_id: int, email: str) -> None:
         c = conn.cursor()
         c.execute("UPDATE user_services SET xui_email = ? WHERE id = ?", (email, service_id))
         conn.commit()
+
+
+def update_service_status(service_id: int, status: str) -> None:
+    with sqlite3.connect(DB_PATH) as conn:
+        c = conn.cursor()
+        c.execute("UPDATE user_services SET status = ? WHERE id = ?", (status, service_id))
+        conn.commit()
+
+
+def update_service_expiry(service_id: int, expiry_date: str, expiry_ms: int) -> None:
+    with sqlite3.connect(DB_PATH) as conn:
+        c = conn.cursor()
+        c.execute(
+            "UPDATE user_services SET expiry_date = ?, expiry_ms = ? WHERE id = ?",
+            (expiry_date, expiry_ms, service_id),
+        )
+        conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# اکانت‌های تست خودکار (بخش ۱) — لیست/شمارش برای پنل ادمین
+# ---------------------------------------------------------------------------
+
+def get_test_services_page(limit: int = 8, offset: int = 0) -> List[dict]:
+    with sqlite3.connect(DB_PATH) as conn:
+        c = conn.cursor()
+        c.execute(
+            """
+            SELECT s.id, s.user_id, s.username, s.link, s.start_date, s.expiry_date,
+                   s.status, s.xui_email, u.full_name
+            FROM user_services s
+            LEFT JOIN users u ON s.user_id = u.user_id
+            WHERE s.kind = 'test'
+            ORDER BY s.id DESC
+            LIMIT ? OFFSET ?
+            """,
+            (limit, offset),
+        )
+        columns = [col[0] for col in c.description]
+        return [dict(zip(columns, row)) for row in c.fetchall()]
+
+
+def count_test_services() -> int:
+    with sqlite3.connect(DB_PATH) as conn:
+        c = conn.cursor()
+        c.execute("SELECT COUNT(*) FROM user_services WHERE kind = 'test'")
+        return c.fetchone()[0]
+
+
+def count_expired_services() -> int:
+    now_str = jdatetime.datetime.now().strftime("%Y/%m/%d %H:%M:%S")
+    with sqlite3.connect(DB_PATH) as conn:
+        c = conn.cursor()
+        c.execute(
+            "SELECT COUNT(*) FROM user_services WHERE status = 'active' AND expiry_date < ?",
+            (now_str,),
+        )
+        return c.fetchone()[0]
+
+
+# ---------------------------------------------------------------------------
+# سیستم Referral (بخش ۶)
+# ---------------------------------------------------------------------------
+
+def record_referral(inviter_id: int, invited_id: int) -> bool:
+    """
+    یک دعوت موفق را ثبت می‌کند و شمارنده‌ی دعوت‌کننده را یکی زیاد می‌کند.
+    اگر invited_id قبلاً ثبت شده باشد (یعنی این کاربر قبلاً یک‌بار به‌عنوان
+    «دعوت‌شده» حساب شده)، False برمی‌گرداند و چیزی تغییر نمی‌کند — این همان
+    قانونی است که «اگر کاربر قبلاً ربات را start کرده بود، حساب نشود» را
+    تضمین می‌کند.
+    """
+    now = jdatetime.datetime.now().strftime("%Y/%m/%d %H:%M:%S")
+    with sqlite3.connect(DB_PATH) as conn:
+        c = conn.cursor()
+        try:
+            c.execute(
+                "INSERT INTO referrals (inviter_id, invited_id, created_at) VALUES (?, ?, ?)",
+                (inviter_id, invited_id, now),
+            )
+        except sqlite3.IntegrityError:
+            return False
+        c.execute("UPDATE users SET invite_count = invite_count + 1 WHERE user_id = ?", (inviter_id,))
+        conn.commit()
+        return True
+
+
+def get_invite_count(user_id: int) -> int:
+    with sqlite3.connect(DB_PATH) as conn:
+        c = conn.cursor()
+        c.execute("SELECT invite_count FROM users WHERE user_id = ?", (user_id,))
+        row = c.fetchone()
+        return row[0] if row else 0
+
+
+def get_referral_rewards_given(user_id: int) -> int:
+    with sqlite3.connect(DB_PATH) as conn:
+        c = conn.cursor()
+        c.execute("SELECT referral_rewards_given FROM users WHERE user_id = ?", (user_id,))
+        row = c.fetchone()
+        return row[0] if row else 0
+
+
+def increment_referral_rewards_given(user_id: int) -> None:
+    with sqlite3.connect(DB_PATH) as conn:
+        c = conn.cursor()
+        c.execute(
+            "UPDATE users SET referral_rewards_given = referral_rewards_given + 1 WHERE user_id = ?",
+            (user_id,),
+        )
+        conn.commit()
+
+
+def add_reward_log(user_id: int, reward_type: str, service_id: Optional[int] = None) -> int:
+    now = jdatetime.datetime.now().strftime("%Y/%m/%d %H:%M:%S")
+    with sqlite3.connect(DB_PATH) as conn:
+        c = conn.cursor()
+        c.execute(
+            "INSERT INTO rewards (user_id, reward_type, service_id, created_at) VALUES (?, ?, ?, ?)",
+            (user_id, reward_type, service_id, now),
+        )
+        conn.commit()
+        return c.lastrowid
+
+
+def get_referral_stats(limit: int = 10, offset: int = 0) -> List[dict]:
+    """لیست کاربرانی که حداقل یک دعوت موفق دارند، برای نمایش در پنل ادمین."""
+    with sqlite3.connect(DB_PATH) as conn:
+        c = conn.cursor()
+        c.execute(
+            """
+            SELECT u.user_id, u.username, u.full_name, u.invite_count, u.referral_rewards_given
+            FROM users u
+            WHERE u.invite_count > 0
+            ORDER BY u.invite_count DESC
+            LIMIT ? OFFSET ?
+            """,
+            (limit, offset),
+        )
+        columns = [col[0] for col in c.description]
+        return [dict(zip(columns, row)) for row in c.fetchall()]
+
+
+def count_users_with_invites() -> int:
+    with sqlite3.connect(DB_PATH) as conn:
+        c = conn.cursor()
+        c.execute("SELECT COUNT(*) FROM users WHERE invite_count > 0")
+        return c.fetchone()[0]
+
+
+# ---------------------------------------------------------------------------
+# سیستم تیکت پشتیبانی (بخش ۳)
+# ---------------------------------------------------------------------------
+
+def create_ticket(user_id: int, username: Optional[str], message: str) -> int:
+    now = jdatetime.datetime.now().strftime("%Y/%m/%d %H:%M:%S")
+    with sqlite3.connect(DB_PATH) as conn:
+        c = conn.cursor()
+        c.execute(
+            "INSERT INTO tickets (user_id, username, message, status, created_at, updated_at) "
+            "VALUES (?, ?, ?, 'open', ?, ?)",
+            (user_id, username, message, now, now),
+        )
+        conn.commit()
+        return c.lastrowid
+
+
+def get_ticket(ticket_id: int) -> Optional[dict]:
+    with sqlite3.connect(DB_PATH) as conn:
+        c = conn.cursor()
+        c.execute("SELECT * FROM tickets WHERE id = ?", (ticket_id,))
+        row = c.fetchone()
+        if not row:
+            return None
+        columns = [col[0] for col in c.description]
+        return dict(zip(columns, row))
+
+
+def list_tickets(status: Optional[str] = None, limit: int = 8, offset: int = 0) -> List[dict]:
+    with sqlite3.connect(DB_PATH) as conn:
+        c = conn.cursor()
+        if status:
+            c.execute(
+                "SELECT * FROM tickets WHERE status = ? ORDER BY id DESC LIMIT ? OFFSET ?",
+                (status, limit, offset),
+            )
+        else:
+            c.execute("SELECT * FROM tickets ORDER BY id DESC LIMIT ? OFFSET ?", (limit, offset))
+        columns = [col[0] for col in c.description]
+        return [dict(zip(columns, row)) for row in c.fetchall()]
+
+
+def count_tickets(status: Optional[str] = None) -> int:
+    with sqlite3.connect(DB_PATH) as conn:
+        c = conn.cursor()
+        if status:
+            c.execute("SELECT COUNT(*) FROM tickets WHERE status = ?", (status,))
+        else:
+            c.execute("SELECT COUNT(*) FROM tickets")
+        return c.fetchone()[0]
+
+
+def set_ticket_reply(ticket_id: int, reply_text: str) -> None:
+    now = jdatetime.datetime.now().strftime("%Y/%m/%d %H:%M:%S")
+    with sqlite3.connect(DB_PATH) as conn:
+        c = conn.cursor()
+        c.execute(
+            "UPDATE tickets SET admin_reply = ?, status = 'answered', updated_at = ? WHERE id = ?",
+            (reply_text, now, ticket_id),
+        )
+        conn.commit()
+
+
+def close_ticket(ticket_id: int) -> None:
+    now = jdatetime.datetime.now().strftime("%Y/%m/%d %H:%M:%S")
+    with sqlite3.connect(DB_PATH) as conn:
+        c = conn.cursor()
+        c.execute(
+            "UPDATE tickets SET status = 'closed', updated_at = ? WHERE id = ?",
+            (now, ticket_id),
+        )
+        conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# مانیتورینگ سرور (بخش ۲) — فقط لاگ اسنپ‌شات؛ خواندن لحظه‌ای در handlers/utils
+# ---------------------------------------------------------------------------
+
+def log_server_stats(cpu_percent: float, ram_percent: float, disk_percent: float, uptime_seconds: int) -> None:
+    now = jdatetime.datetime.now().strftime("%Y/%m/%d %H:%M:%S")
+    with sqlite3.connect(DB_PATH) as conn:
+        c = conn.cursor()
+        c.execute(
+            "INSERT INTO server_stats (cpu_percent, ram_percent, disk_percent, uptime_seconds, created_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (cpu_percent, ram_percent, disk_percent, uptime_seconds, now),
+        )
+        conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# لاگ نوتیفیکیشن‌های ادمین (بخش ۵ و غیره)
+# ---------------------------------------------------------------------------
+
+def log_notification(notif_type: str, payload: str = "") -> None:
+    now = jdatetime.datetime.now().strftime("%Y/%m/%d %H:%M:%S")
+    with sqlite3.connect(DB_PATH) as conn:
+        c = conn.cursor()
+        c.execute(
+            "INSERT INTO notifications (type, payload, created_at) VALUES (?, ?, ?)",
+            (notif_type, payload, now),
+        )
+        conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# آمار فروش حرفه‌ای (بخش ۴)
+# ---------------------------------------------------------------------------
+
+def _today_jalali_prefix() -> str:
+    return jdatetime.datetime.now().strftime("%Y/%m/%d")
+
+
+def _this_month_jalali_prefix() -> str:
+    return jdatetime.datetime.now().strftime("%Y/%m")
+
+
+def get_daily_sales_report() -> dict:
+    today = _today_jalali_prefix()
+    with sqlite3.connect(DB_PATH) as conn:
+        c = conn.cursor()
+
+        c.execute(
+            "SELECT COUNT(*), COALESCE(SUM(price), 0) FROM orders "
+            "WHERE status = 'completed' AND product_key != 'topup' AND order_date LIKE ?",
+            (f"{today}%",),
+        )
+        purchase_count, revenue = c.fetchone()
+
+        c.execute("SELECT COUNT(*) FROM users WHERE join_date LIKE ?", (f"{today}%",))
+        new_users = c.fetchone()[0]
+
+        c.execute(
+            "SELECT COUNT(*) FROM notifications WHERE type = 'test_renew' AND created_at LIKE ?",
+            (f"{today}%",),
+        )
+        renewals = c.fetchone()[0]
+
+        c.execute(
+            "SELECT COUNT(*) FROM user_services WHERE kind = 'test' AND start_date LIKE ?",
+            (f"{today}%",),
+        )
+        test_count = c.fetchone()[0]
+
+        c.execute("SELECT COUNT(*) FROM user_services WHERE status = 'active'")
+        active_services = c.fetchone()[0]
+
+        now_str = jdatetime.datetime.now().strftime("%Y/%m/%d %H:%M:%S")
+        c.execute(
+            "SELECT COUNT(*) FROM user_services WHERE status = 'active' AND expiry_date < ?",
+            (now_str,),
+        )
+        expired_services = c.fetchone()[0]
+
+    return {
+        "purchase_count": purchase_count,
+        "revenue": revenue,
+        "new_users": new_users,
+        "renewals": renewals,
+        "test_count": test_count,
+        "active_services": active_services,
+        "expired_services": expired_services,
+    }
+
+
+def get_monthly_sales_report() -> dict:
+    month_prefix = _this_month_jalali_prefix()
+    with sqlite3.connect(DB_PATH) as conn:
+        c = conn.cursor()
+
+        c.execute(
+            "SELECT COALESCE(SUM(price), 0), COUNT(*) FROM orders "
+            "WHERE status = 'completed' AND product_key != 'topup' AND order_date LIKE ?",
+            (f"{month_prefix}%",),
+        )
+        revenue, purchase_count = c.fetchone()
+
+        c.execute(
+            """
+            SELECT product_key, COUNT(*) as cnt, COALESCE(SUM(price), 0) as rev
+            FROM orders
+            WHERE status = 'completed' AND product_key != 'topup' AND order_date LIKE ?
+            GROUP BY product_key
+            ORDER BY cnt DESC
+            LIMIT 5
+            """,
+            (f"{month_prefix}%",),
+        )
+        top_products = [{"product_key": r[0], "count": r[1], "revenue": r[2]} for r in c.fetchall()]
+
+        c.execute(
+            """
+            SELECT o.user_id, COUNT(*) as cnt, u.username, u.full_name
+            FROM orders o
+            LEFT JOIN users u ON o.user_id = u.user_id
+            WHERE o.status = 'completed' AND o.product_key != 'topup' AND o.order_date LIKE ?
+            GROUP BY o.user_id
+            ORDER BY cnt DESC
+            LIMIT 5
+            """,
+            (f"{month_prefix}%",),
+        )
+        top_users = [{"user_id": r[0], "count": r[1], "username": r[2], "full_name": r[3]} for r in c.fetchall()]
+
+    return {
+        "revenue": revenue,
+        "purchase_count": purchase_count,
+        "top_products": top_products,
+        "top_users": top_users,
+    }

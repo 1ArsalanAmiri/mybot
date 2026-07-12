@@ -82,6 +82,7 @@ def get_main_menu_keyboard(show_admin_panel: bool = False) -> InlineKeyboardMark
         ],
         [
             InlineKeyboardButton("👨‍💻 پشتیبانی", callback_data="support"),
+            InlineKeyboardButton("🎯 دعوت دوستان", callback_data="referral_info"),
         ],
     ]
     if show_admin_panel:
@@ -164,10 +165,15 @@ def get_payment_method_keyboard() -> InlineKeyboardMarkup:
 def get_support_keyboard() -> InlineKeyboardMarkup:
     keyboard = [
         [InlineKeyboardButton("💡 سوالات متداول", callback_data="faq")],
+        [InlineKeyboardButton("🆘 ارسال تیکت پشتیبانی", callback_data="ticket_new")],
         [InlineKeyboardButton("💬 ارسال پیام به پشتیبانی", url="https://t.me/arsalanvpn1_support")],
         [InlineKeyboardButton("🔙 برگردیم به منوی اصلی", callback_data="main_menu")]
     ]
     return InlineKeyboardMarkup(keyboard)
+
+
+def get_ticket_cancel_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton("❌ انصراف", callback_data="support")]])
 
 
 def get_wallet_keyboard() -> InlineKeyboardMarkup:
@@ -187,9 +193,142 @@ def get_admin_panel_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("📦 موجودی محصولات", callback_data="admin_stock")],
         [InlineKeyboardButton("🛠 مدیریت کانفیگ‌ها", callback_data="admin_cfgpick_0")],
         [InlineKeyboardButton("👥 کاربران دارای سرویس", callback_data="admin_users_0")],
+        [InlineKeyboardButton("🧪 اکانت‌های تست", callback_data="admin_tests_0")],
+        [InlineKeyboardButton("🖥 وضعیت سرورها", callback_data="admin_monitor")],
+        [InlineKeyboardButton("🎫 تیکت‌های پشتیبانی", callback_data="admin_tickets_0")],
+        [InlineKeyboardButton("📊 آمار فروش", callback_data="admin_stats")],
+        [InlineKeyboardButton("🎁 آمار Referral", callback_data="admin_referrals_0")],
         [InlineKeyboardButton("📢 ارسال پیام همگانی", callback_data="admin_broadcast")],
         [InlineKeyboardButton("📚 راهنمای ادمین", callback_data="admin_help_panel")],
     ]
+    return InlineKeyboardMarkup(keyboard)
+
+
+# ---------------------------------------------------------------------------
+# اکانت‌های تست خودکار (بخش ۱)
+# ---------------------------------------------------------------------------
+
+def get_admin_tests_keyboard(services: List[dict], page: int, total_pages: int) -> InlineKeyboardMarkup:
+    keyboard = [[InlineKeyboardButton("➕ ساخت تست برای کاربر", callback_data="admin_test_create")]]
+    for svc in services:
+        keyboard.append([InlineKeyboardButton(
+            f"#{svc['id']} — {svc.get('username') or svc['user_id']}",
+            callback_data=f"admin_testitem_{svc['id']}_{page}",
+        )])
+    nav_row = []
+    if page > 0:
+        nav_row.append(InlineKeyboardButton("◀️ قبلی", callback_data=f"admin_tests_{page - 1}"))
+    if page < total_pages - 1:
+        nav_row.append(InlineKeyboardButton("بعدی ▶️", callback_data=f"admin_tests_{page + 1}"))
+    if nav_row:
+        keyboard.append(nav_row)
+    keyboard.append([InlineKeyboardButton("🔙 بازگشت به پنل", callback_data="admin_panel")])
+    return InlineKeyboardMarkup(keyboard)
+
+
+def get_admin_test_item_keyboard(service_id: int, page: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("♻️ تمدید ۲۴ساعت", callback_data=f"admin_testrenew_{service_id}_{page}"),
+            InlineKeyboardButton("🗑 حذف", callback_data=f"admin_testdel_{service_id}_{page}"),
+        ],
+        [InlineKeyboardButton("🔙 بازگشت به لیست", callback_data=f"admin_tests_{page}")],
+    ])
+
+
+def get_admin_test_delete_confirm_keyboard(service_id: int, page: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ بله، حذف کن", callback_data=f"admin_testdelok_{service_id}_{page}")],
+        [InlineKeyboardButton("❌ انصراف", callback_data=f"admin_tests_{page}")],
+    ])
+
+
+def get_admin_test_create_cancel_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton("❌ لغو", callback_data="admin_tests_0")]])
+
+
+# ---------------------------------------------------------------------------
+# مانیتورینگ سرور (بخش ۲)
+# ---------------------------------------------------------------------------
+
+def get_admin_monitor_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔄 بروزرسانی", callback_data="admin_monitor")],
+        [InlineKeyboardButton("🔙 بازگشت به پنل", callback_data="admin_panel")],
+    ])
+
+
+# ---------------------------------------------------------------------------
+# تیکت پشتیبانی (بخش ۳)
+# ---------------------------------------------------------------------------
+
+def get_admin_tickets_keyboard(tickets: List[dict], page: int, total_pages: int) -> InlineKeyboardMarkup:
+    status_icon = {"open": "🟡", "answered": "🟢", "closed": "⚪️"}
+    keyboard = []
+    for t in tickets:
+        icon = status_icon.get(t["status"], "🟡")
+        keyboard.append([InlineKeyboardButton(
+            f"{icon} تیکت #{t['id']} — {t.get('username') or t['user_id']}",
+            callback_data=f"admin_ticket_{t['id']}_{page}",
+        )])
+    nav_row = []
+    if page > 0:
+        nav_row.append(InlineKeyboardButton("◀️ قبلی", callback_data=f"admin_tickets_{page - 1}"))
+    if page < total_pages - 1:
+        nav_row.append(InlineKeyboardButton("بعدی ▶️", callback_data=f"admin_tickets_{page + 1}"))
+    if nav_row:
+        keyboard.append(nav_row)
+    keyboard.append([InlineKeyboardButton("🔙 بازگشت به پنل", callback_data="admin_panel")])
+    return InlineKeyboardMarkup(keyboard)
+
+
+def get_admin_ticket_detail_keyboard(ticket_id: int, page: int, status: str) -> InlineKeyboardMarkup:
+    keyboard = [[InlineKeyboardButton("✍️ پاسخ دادن", callback_data=f"admin_ticketreply_{ticket_id}_{page}")]]
+    if status != "closed":
+        keyboard.append([InlineKeyboardButton("✅ بستن تیکت", callback_data=f"admin_ticketclose_{ticket_id}_{page}")])
+    keyboard.append([InlineKeyboardButton("🔙 بازگشت به لیست", callback_data=f"admin_tickets_{page}")])
+    return InlineKeyboardMarkup(keyboard)
+
+
+def get_admin_ticket_reply_cancel_keyboard(ticket_id: int, page: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton("❌ لغو", callback_data=f"admin_ticket_{ticket_id}_{page}")]])
+
+
+# ---------------------------------------------------------------------------
+# آمار فروش (بخش ۴)
+# ---------------------------------------------------------------------------
+
+def get_admin_stats_keyboard(view: str = "daily") -> InlineKeyboardMarkup:
+    daily_label = "📅 روزانه ✅" if view == "daily" else "📅 روزانه"
+    monthly_label = "🗓 ماهانه ✅" if view == "monthly" else "🗓 ماهانه"
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(daily_label, callback_data="admin_stats_daily"),
+            InlineKeyboardButton(monthly_label, callback_data="admin_stats_monthly"),
+        ],
+        [InlineKeyboardButton("🔄 بروزرسانی", callback_data=f"admin_stats_{view}")],
+        [InlineKeyboardButton("🔙 بازگشت به پنل", callback_data="admin_panel")],
+    ])
+
+
+# ---------------------------------------------------------------------------
+# Referral (بخش ۶)
+# ---------------------------------------------------------------------------
+
+def get_referral_info_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت به منوی اصلی", callback_data="main_menu")]])
+
+
+def get_admin_referrals_keyboard(page: int, total_pages: int) -> InlineKeyboardMarkup:
+    nav_row = []
+    if page > 0:
+        nav_row.append(InlineKeyboardButton("◀️ قبلی", callback_data=f"admin_referrals_{page - 1}"))
+    if page < total_pages - 1:
+        nav_row.append(InlineKeyboardButton("بعدی ▶️", callback_data=f"admin_referrals_{page + 1}"))
+    keyboard = []
+    if nav_row:
+        keyboard.append(nav_row)
+    keyboard.append([InlineKeyboardButton("🔙 بازگشت به پنل", callback_data="admin_panel")])
     return InlineKeyboardMarkup(keyboard)
 
 

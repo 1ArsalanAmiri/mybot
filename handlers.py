@@ -2,6 +2,10 @@ from html import escape
 import asyncio
 import logging
 import os
+import platform
+import shutil
+import subprocess
+import time
 from typing import Optional
 
 import jdatetime
@@ -9,7 +13,12 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Labeled
 from telegram.ext import ContextTypes, ConversationHandler
 from telegram.error import BadRequest, TelegramError
 
-from config import ADMIN_ID, CHANNEL_ID, TRANSACTION_LOG_CHANNEL_ID, TOMAN_PER_STAR
+from config import (
+    ADMIN_ID, CHANNEL_ID, TRANSACTION_LOG_CHANNEL_ID, TOMAN_PER_STAR,
+    TEST_ACCOUNT_VOLUME_GB, TEST_ACCOUNT_DURATION_HOURS,
+    REFERRAL_REQUIRED_INVITES, REFERRAL_GIFT_LABEL, REFERRAL_GIFT_DURATION_DAYS,
+    XUI_SERVICE_NAME, BOT_SERVICE_NAME, SERVER_DISPLAY_LABEL,
+)
 from db import (
     get_user_balance, get_or_create_user, has_used_test_account,
     get_available_config, get_user_orders,
@@ -20,6 +29,13 @@ from db import (
     add_user_balance, mark_config_sold,
     create_user_service, get_user_services_list, count_active_user_services,
     get_all_user_ids, get_services_by_user, get_user_service_by_id, set_service_xui_email,
+    get_user_by_referral_code, get_user_by_id, record_referral, get_invite_count,
+    get_referral_rewards_given, increment_referral_rewards_given, add_reward_log,
+    get_referral_stats, count_users_with_invites,
+    create_ticket, get_ticket, list_tickets, count_tickets, set_ticket_reply, close_ticket,
+    get_test_services_page, count_test_services, update_service_status, update_service_expiry,
+    log_server_stats, log_notification,
+    get_daily_sales_report, get_monthly_sales_report,
 )
 from utils import (
     build_order_text,
@@ -41,6 +57,7 @@ from utils import (
     generate_qr_code,
 )
 import xui_db
+import xui_api
 from keyboads import (
     get_main_menu_keyboard, get_wallet_keyboard, get_support_keyboard, get_products_keyboard,
     DURATION_CODE_TO_DAYS, get_duration_menu_keyboard, get_payment_method_keyboard, PRODUCTS,
@@ -48,7 +65,11 @@ from keyboads import (
     get_admin_panel_keyboard, get_admin_users_pagination_keyboard, get_admin_back_keyboard,
     get_admin_product_picker_keyboard, get_admin_product_actions_keyboard,
     get_admin_config_list_keyboard, get_admin_delall_confirm_keyboard, get_admin_cancel_add_keyboard,
-    get_service_detail_keyboard,
+    get_service_detail_keyboard, get_ticket_cancel_keyboard,
+    get_admin_tests_keyboard, get_admin_test_item_keyboard, get_admin_test_delete_confirm_keyboard,
+    get_admin_test_create_cancel_keyboard, get_admin_monitor_keyboard,
+    get_admin_tickets_keyboard, get_admin_ticket_detail_keyboard, get_admin_ticket_reply_cancel_keyboard,
+    get_admin_stats_keyboard, get_referral_info_keyboard, get_admin_referrals_keyboard,
 )
 
 # ---------------------------------------------------------------------------
@@ -79,6 +100,21 @@ BAD_WORDS = {
 
 def is_admin(user_id: int) -> bool:
     return bool(ADMIN_ID and user_id == ADMIN_ID)
+
+
+class _ShimUser:
+    """
+    یک آبجکت سبک شبیه ``telegram.User`` که فقط id/username/first_name/last_name
+    دارد؛ برای فراخوانی توابع نوتیف ادمین در utils.py (که get_safe_username
+    صدا می‌زنند) در جاهایی که آبجکت واقعی User در دسترس نیست (مثلاً وقتی
+    ادمین برای یک user_id دلخواه از پنل اکانت تست می‌سازد).
+    """
+
+    def __init__(self, user_id: int, username: Optional[str] = None):
+        self.id = user_id
+        self.username = username
+        self.first_name = None
+        self.last_name = None
 
 
 def contains_profanity(text: str) -> bool:
@@ -316,8 +352,145 @@ async def _deliver_product(
 # دستورات کاربر
 # ---------------------------------------------------------------------------
 
+async def _capture_referral_code(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    اگر /start با payload آمده باشد (t.me/BotName?start=<referral_code>)، آن را
+    برای استفاده‌ی بعدی (چه همین الان، چه بعد از تأیید عضویت کانال) در
+    user_data ذخیره می‌کند. خودِ کاربر نمی‌تواند کد خودش را استفاده کند —
+    آن بررسی در _finalize_new_user انجام می‌شود.
+    """
+    args = context.args or []
+    if args and args[0].strip():
+        context.user_data["pending_ref_code"] = args[0].strip()
+
+
+async def _finalize_new_user(update: Update, context: ContextTypes.DEFAULT_TYPE, user, full_name: str) -> dict:
+    """
+    get_or_create_user را با inviter احتمالی صدا می‌زند، نوتیف «کاربر جدید»
+    (بخش ۵) را فقط برای اولین start ارسال می‌کند، و اگر دعوت معتبر بود
+    Referral را ثبت و در صورت رسیدن به سقف، هدیه را اعطا می‌کند (بخش ۶).
+    """
+    ref_code = context.user_data.pop("pending_ref_code", None)
+    inviter_id = None
+    if ref_code:
+        inviter = get_user_by_referral_code(ref_code)
+        if inviter:
+            inviter_id = inviter["user_id"]
+
+    db_user = get_or_create_user(user.id, user.username, full_name, inviter_id=inviter_id)
+
+    if db_user.get("_is_new"):
+        username_display = f"@{escape(user.username)}" if user.username else "بدون یوزرنیم"
+        notif_text = (
+            "👤 <b>کاربر جدید</b>\n"
+            "━━━━━━━━━━━━━━━\n"
+            f"🆔 <code>{user.id}</code>\n"
+            f"یوزرنیم: {username_display}\n"
+            f"نام: {escape(full_name)}\n"
+            f"تاریخ: {db_user.get('join_date', get_jalali_now())}\n"
+            f"نوع کاربر: New User"
+        )
+        await notify_admin(context, notif_text)
+        log_notification("new_user", str(user.id))
+
+        if inviter_id:
+            recorded = record_referral(inviter_id, user.id)
+            if recorded:
+                await _maybe_grant_referral_reward(context, inviter_id)
+
+    return db_user
+
+
+async def _maybe_grant_referral_reward(context: ContextTypes.DEFAULT_TYPE, inviter_id: int) -> None:
+    """اگر دعوت‌کننده به سقف REFERRAL_REQUIRED_INVITES رسیده، هدیه‌ی ۳۰روزه‌ی نامحدود می‌سازد."""
+    invite_count = get_invite_count(inviter_id)
+    rewards_given = get_referral_rewards_given(inviter_id)
+    # هر ۵ (یا REFERRAL_REQUIRED_INVITES) دعوت موفق یک هدیه؛ اگر کاربر به سقف بعدی رسیده
+    earned = invite_count // REFERRAL_REQUIRED_INVITES
+    if earned <= rewards_given:
+        return
+
+    inviter = get_user_by_id(inviter_id)
+    if not inviter:
+        return
+
+    try:
+        created = await asyncio.to_thread(
+            xui_api.create_client,
+            "referral_gift",
+            inviter_id,
+            REFERRAL_GIFT_DURATION_DAYS,
+            0,  # حجم نامحدود
+            f"ref-gift-{inviter_id}",
+        )
+    except xui_api.XUIAPIError as e:
+        logger.error("Referral gift creation failed for %s: %s", inviter_id, e, exc_info=True)
+        await notify_admin(
+            context,
+            f"⚠️ ساخت هدیه‌ی Referral برای <code>{inviter_id}</code> ناموفق بود:\n{escape(str(e))}",
+        )
+        return
+
+    service_id = create_user_service(
+        user_id=inviter_id,
+        username=inviter.get("username"),
+        service_type="paid",
+        product_key="referral_gift",
+        config_id=None,
+        link=created["link"] or "",
+        size="نامحدود",
+        duration_days=REFERRAL_GIFT_DURATION_DAYS,
+        kind="gift",
+        xui_client_uuid=created["uuid_or_password"],
+        xui_inbound_id=created["inbound_id"],
+        xui_email=created["email"],
+        total_bytes=0,
+        expiry_ms=created["expiry_ms"],
+        protocol=created["protocol"],
+    )
+    increment_referral_rewards_given(inviter_id)
+    add_reward_log(inviter_id, "referral_gift", service_id)
+    log_notification("referral_reward", str(inviter_id))
+
+    congrats_text = (
+        "🎉 <b>تبریک!</b>\n\n"
+        f"{REFERRAL_REQUIRED_INVITES} دوست با لینک شما وارد ربات شدند.\n"
+        f"یک اشتراک <b>{escape(REFERRAL_GIFT_LABEL)}</b> هدیه برای شما فعال شد. 🎁"
+    )
+    reply_markup = InlineKeyboardMarkup([[InlineKeyboardButton("📁 سرویس‌های من", callback_data="my_services")]])
+
+    if created["link"]:
+        try:
+            qr_bio = generate_qr_code(created["link"])
+            await context.bot.send_photo(
+                chat_id=inviter_id, photo=qr_bio, caption=congrats_text,
+                parse_mode="HTML", reply_markup=reply_markup,
+            )
+        except Exception as e:
+            logger.error("Could not send referral gift QR to %s: %s", inviter_id, e, exc_info=True)
+            await context.bot.send_message(chat_id=inviter_id, text=congrats_text, parse_mode="HTML", reply_markup=reply_markup)
+    else:
+        await context.bot.send_message(
+            chat_id=inviter_id,
+            text=congrats_text + "\n\n⚠️ لینک اتصال آماده نشد، ادمین به‌زودی برایتان ارسال می‌کند.",
+            parse_mode="HTML", reply_markup=reply_markup,
+        )
+        await notify_admin(
+            context,
+            f"⚠️ هدیه‌ی Referral برای <code>{inviter_id}</code> ساخته شد ولی لینک subscription خالی بود؛ "
+            "لطفاً دستی بررسی کن (تنظیمات subscription پنل x-ui).",
+        )
+
+    await log_admin_event(
+        context, "🎁 هدیه‌ی Referral اعطا شد",
+        f"🆔 <code>{inviter_id}</code>\nدعوت‌های موفق: {invite_count}\nشماره هدیه: {earned}",
+    )
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
+    await _capture_referral_code(update, context)
+
     if CHANNEL_ID and not await check_user_membership(user.id, context.bot):
         channel_url = f"https://t.me/{CHANNEL_ID.replace('@', '')}"
         join_text = (
@@ -335,7 +508,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    get_user_balance(user.id)
+    full_name = " ".join(filter(None, [user.first_name, user.last_name])).strip() or "کاربر"
+    await _finalize_new_user(update, context, user, full_name)
     first_name = escape(user.first_name or "داداش")
     welcome_text = (
         f"سلام <b>{first_name}</b> عزیز، خوش اومدی 👋\n\n"
@@ -830,7 +1004,442 @@ async def _handle_admin_callbacks(query, context, data, mark_and_answer) -> bool
         )
         return True
 
+    # -----------------------------------------------------------------
+    # اکانت‌های تست خودکار (بخش ۱)
+    # -----------------------------------------------------------------
+
+    if data.startswith("admin_tests_"):
+        try:
+            page = int(data[len("admin_tests_"):])
+        except ValueError:
+            page = 0
+        await _render_admin_tests_list(query, page)
+        return True
+
+    if data == "admin_test_create":
+        context.user_data["awaiting_admin_test_target"] = True
+        await _edit_admin_message(
+            query,
+            "➕ <b>ساخت اکانت تست برای کاربر</b>\n\nآیدی عددی تلگرام (Telegram ID) کاربر رو بفرست.\n"
+            "برای لغو /cancel بزن یا دکمه زیر رو بزن.",
+            get_admin_test_create_cancel_keyboard(),
+        )
+        return True
+
+    if data.startswith("admin_testitem_"):
+        try:
+            _, rest = data.split("admin_testitem_", 1)
+            service_id_str, page_str = rest.rsplit("_", 1)
+            service_id, page = int(service_id_str), int(page_str)
+        except ValueError:
+            await mark_and_answer("خطای داخلی.", alert=True)
+            return True
+        await _render_admin_test_detail(query, service_id, page)
+        return True
+
+    if data.startswith("admin_testrenew_"):
+        try:
+            _, rest = data.split("admin_testrenew_", 1)
+            service_id_str, page_str = rest.rsplit("_", 1)
+            service_id, page = int(service_id_str), int(page_str)
+        except ValueError:
+            await mark_and_answer("خطای داخلی.", alert=True)
+            return True
+        await _admin_renew_test(query, context, service_id, page, mark_and_answer)
+        return True
+
+    if data.startswith("admin_testdelok_"):
+        try:
+            _, rest = data.split("admin_testdelok_", 1)
+            service_id_str, page_str = rest.rsplit("_", 1)
+            service_id, page = int(service_id_str), int(page_str)
+        except ValueError:
+            await mark_and_answer("خطای داخلی.", alert=True)
+            return True
+        await _admin_delete_test(query, context, service_id, page, mark_and_answer)
+        return True
+
+    if data.startswith("admin_testdel_"):
+        try:
+            _, rest = data.split("admin_testdel_", 1)
+            service_id_str, page_str = rest.rsplit("_", 1)
+            service_id, page = int(service_id_str), int(page_str)
+        except ValueError:
+            await mark_and_answer("خطای داخلی.", alert=True)
+            return True
+        await _edit_admin_message(
+            query, f"⚠️ مطمئنی می‌خوای سرویس تست #{service_id} حذف بشه؟ (کلاینت از x-ui هم حذف می‌شود)",
+            get_admin_test_delete_confirm_keyboard(service_id, page),
+        )
+        return True
+
+    # -----------------------------------------------------------------
+    # مانیتورینگ سرور (بخش ۲)
+    # -----------------------------------------------------------------
+
+    if data == "admin_monitor":
+        text = await asyncio.to_thread(_build_server_monitor_text)
+        await _edit_admin_message(query, text, get_admin_monitor_keyboard())
+        return True
+
+    # -----------------------------------------------------------------
+    # تیکت پشتیبانی (بخش ۳)
+    # -----------------------------------------------------------------
+
+    if data.startswith("admin_tickets_"):
+        try:
+            page = int(data[len("admin_tickets_"):])
+        except ValueError:
+            page = 0
+        await _render_admin_tickets_list(query, page)
+        return True
+
+    if data.startswith("admin_ticketreply_"):
+        try:
+            _, rest = data.split("admin_ticketreply_", 1)
+            ticket_id_str, page_str = rest.rsplit("_", 1)
+            ticket_id, page = int(ticket_id_str), int(page_str)
+        except ValueError:
+            await mark_and_answer("خطای داخلی.", alert=True)
+            return True
+        context.user_data["awaiting_admin_ticket_reply"] = {"ticket_id": ticket_id, "page": page}
+        await _edit_admin_message(
+            query, f"✍️ متن پاسخ تیکت #{ticket_id} رو بفرست.\nبرای لغو /cancel.",
+            get_admin_ticket_reply_cancel_keyboard(ticket_id, page),
+        )
+        return True
+
+    if data.startswith("admin_ticketclose_"):
+        try:
+            _, rest = data.split("admin_ticketclose_", 1)
+            ticket_id_str, page_str = rest.rsplit("_", 1)
+            ticket_id, page = int(ticket_id_str), int(page_str)
+        except ValueError:
+            await mark_and_answer("خطای داخلی.", alert=True)
+            return True
+        close_ticket(ticket_id)
+        await mark_and_answer("✅ تیکت بسته شد.")
+        await _render_admin_ticket_detail(query, ticket_id, page)
+        return True
+
+    if data.startswith("admin_ticket_"):
+        try:
+            _, rest = data.split("admin_ticket_", 1)
+            ticket_id_str, page_str = rest.rsplit("_", 1)
+            ticket_id, page = int(ticket_id_str), int(page_str)
+        except ValueError:
+            await mark_and_answer("خطای داخلی.", alert=True)
+            return True
+        await _render_admin_ticket_detail(query, ticket_id, page)
+        return True
+
+    # -----------------------------------------------------------------
+    # آمار فروش (بخش ۴)
+    # -----------------------------------------------------------------
+
+    if data in ("admin_stats", "admin_stats_daily"):
+        await _render_admin_stats(query, "daily")
+        return True
+
+    if data == "admin_stats_monthly":
+        await _render_admin_stats(query, "monthly")
+        return True
+
+    # -----------------------------------------------------------------
+    # آمار Referral (بخش ۶)
+    # -----------------------------------------------------------------
+
+    if data.startswith("admin_referrals_"):
+        try:
+            page = int(data[len("admin_referrals_"):])
+        except ValueError:
+            page = 0
+        await _render_admin_referrals(query, page)
+        return True
+
     return False
+
+
+TEST_LIST_PAGE_SIZE = 8
+TICKET_LIST_PAGE_SIZE = 8
+REFERRAL_LIST_PAGE_SIZE = 10
+
+
+# ---------------------------------------------------------------------------
+# اکانت‌های تست خودکار — رندر پنل ادمین (بخش ۱)
+# ---------------------------------------------------------------------------
+
+async def _render_admin_tests_list(query, page: int) -> None:
+    total = count_test_services()
+    total_pages = max(1, (total + TEST_LIST_PAGE_SIZE - 1) // TEST_LIST_PAGE_SIZE)
+    page = max(0, min(page, total_pages - 1))
+    offset = page * TEST_LIST_PAGE_SIZE
+    services = get_test_services_page(limit=TEST_LIST_PAGE_SIZE, offset=offset)
+
+    text = f"🧪 <b>اکانت‌های تست</b> (صفحه {page + 1}/{total_pages}, مجموع {total})\n\n"
+    if not services:
+        text += "هیچ اکانت تستی ثبت نشده."
+    else:
+        for svc in services:
+            status_icon = "✅" if svc["status"] == "active" else "⛔️"
+            text += f"{status_icon} #{svc['id']} — {svc.get('username') or svc['user_id']} — تا {svc['expiry_date']}\n"
+
+    await _edit_admin_message(query, text, get_admin_tests_keyboard(services, page, total_pages))
+
+
+async def _render_admin_test_detail(query, service_id: int, page: int) -> None:
+    svc = get_user_service_by_id(service_id)
+    if not svc:
+        await _edit_admin_message(query, "⚠️ این سرویس تست پیدا نشد.", get_admin_back_keyboard())
+        return
+
+    live_status = "نامشخص"
+    if svc.get("xui_email"):
+        status = await asyncio.to_thread(xui_db.get_client_status, svc["xui_email"])
+        if status is not None:
+            live_status = "فعال ✅" if status else "غیرفعال ❌"
+
+    text = (
+        f"🧪 <b>سرویس تست #{service_id}</b>\n"
+        f"👤 کاربر: <code>{svc['user_id']}</code> ({svc.get('username') or '—'})\n"
+        f"📊 وضعیت زنده در x-ui: {live_status}\n"
+        f"📅 شروع: {svc['start_date']}\n"
+        f"⏳ انقضا: {svc['expiry_date']}\n"
+        f"🔗 <code>{escape(svc.get('link') or '—')}</code>"
+    )
+    await _edit_admin_message(query, text, get_admin_test_item_keyboard(service_id, page))
+
+
+async def _admin_renew_test(query, context, service_id: int, page: int, mark_and_answer) -> None:
+    svc = get_user_service_by_id(service_id)
+    if not svc or not svc.get("xui_email") or not svc.get("xui_inbound_id"):
+        await mark_and_answer("⚠️ اطلاعات کلاینت x-ui این سرویس ناقص است؛ نمی‌شود تمدید کرد.", alert=True)
+        return
+
+    try:
+        new_expiry_ms = await asyncio.to_thread(
+            xui_api.extend_client, svc["xui_inbound_id"], svc["xui_email"], TEST_ACCOUNT_DURATION_HOURS / 24.0
+        )
+    except xui_api.XUIAPIError as e:
+        await mark_and_answer(f"❌ تمدید ناموفق بود: {e}", alert=True)
+        return
+
+    new_expiry_date = xui_db.format_expiry(new_expiry_ms)
+    update_service_expiry(service_id, new_expiry_date, new_expiry_ms)
+    update_service_status(service_id, "active")
+    log_notification("test_renew", str(service_id))
+
+    try:
+        await context.bot.send_message(
+            chat_id=svc["user_id"],
+            text=f"♻️ اکانت تست شما {TEST_ACCOUNT_DURATION_HOURS} ساعت دیگر تمدید شد.",
+        )
+    except TelegramError:
+        pass
+
+    await mark_and_answer("✅ تمدید شد.")
+    await _render_admin_test_detail(query, service_id, page)
+
+
+async def _admin_delete_test(query, context, service_id: int, page: int, mark_and_answer) -> None:
+    svc = get_user_service_by_id(service_id)
+    if not svc:
+        await mark_and_answer("⚠️ این سرویس پیدا نشد.", alert=True)
+        await _render_admin_tests_list(query, page)
+        return
+
+    if svc.get("xui_email") and svc.get("xui_inbound_id"):
+        try:
+            await asyncio.to_thread(xui_api.delete_client, svc["xui_inbound_id"], svc["xui_email"])
+        except xui_api.XUIAPIError as e:
+            logger.error("Failed to delete test client %s from x-ui: %s", svc.get("xui_email"), e, exc_info=True)
+            await mark_and_answer(f"⚠️ حذف از x-ui ناموفق بود ({e})؛ فقط در دیتابیس ربات غیرفعال شد.", alert=True)
+
+    update_service_status(service_id, "deleted")
+    await mark_and_answer("🗑 حذف شد.")
+    await _render_admin_tests_list(query, page)
+
+
+# ---------------------------------------------------------------------------
+# مانیتورینگ سرور (بخش ۲)
+# ---------------------------------------------------------------------------
+
+def _systemd_status(service_name: str) -> str:
+    if not service_name:
+        return "نامشخص"
+    try:
+        result = subprocess.run(
+            ["systemctl", "is-active", service_name],
+            capture_output=True, text=True, timeout=5,
+        )
+        state = result.stdout.strip()
+        return "Online ✅" if state == "active" else f"{state or 'unknown'} ❌"
+    except Exception:
+        return "نامشخص"
+
+
+def _format_uptime(seconds: int) -> str:
+    days, rem = divmod(int(seconds), 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, _ = divmod(rem, 60)
+    parts = []
+    if days:
+        parts.append(f"{days} روز")
+    if hours:
+        parts.append(f"{hours} ساعت")
+    parts.append(f"{minutes} دقیقه")
+    return " و ".join(parts)
+
+
+def _build_server_monitor_text() -> str:
+    """
+    این تابع sync است (روی thread جدا صدا زده می‌شود) چون psutil.cpu_percent با
+    interval بلاک‌کننده است. طبق تصمیم فعلی فقط همین سرور (لوکال) پایش می‌شود.
+    """
+    try:
+        import psutil
+    except ImportError:
+        return "⚠️ کتابخانه‌ی psutil نصب نیست. روی سرور اجرا کن: pip install psutil --break-system-packages"
+
+    cpu_percent = psutil.cpu_percent(interval=1)
+    ram = psutil.virtual_memory()
+    disk = psutil.disk_usage("/")
+    uptime_seconds = int(time.time() - psutil.boot_time())
+
+    try:
+        log_server_stats(cpu_percent, ram.percent, disk.percent, uptime_seconds)
+    except Exception as e:
+        logger.error("log_server_stats failed: %s", e, exc_info=True)
+
+    client_counts = xui_db.count_clients()
+    total_active_services = count_active_user_services()
+    expired_services = count_expired_services()
+
+    xui_status = _systemd_status(XUI_SERVICE_NAME)
+    bot_status = _systemd_status(BOT_SERVICE_NAME) if BOT_SERVICE_NAME else "تنظیم نشده (BOT_SERVICE_NAME در config.py)"
+
+    return (
+        f"🖥 <b>{escape(SERVER_DISPLAY_LABEL)}</b>\n"
+        "━━━━━━━━━━━━━━━\n"
+        f"CPU: {cpu_percent:.0f}%\n"
+        f"RAM: {ram.percent:.0f}%\n"
+        f"Disk: {disk.percent:.0f}%\n"
+        f"Server Uptime: {_format_uptime(uptime_seconds)}\n"
+        "━━━━━━━━━━━━━━━\n"
+        f"👥 کاربران آنلاین x-ui (فعال): {client_counts['active']} / {client_counts['total']}\n"
+        f"📦 کل سرویس‌های فعال ربات: {total_active_services}\n"
+        f"⌛️ سرویس‌های منقضی: {expired_services}\n"
+        "━━━━━━━━━━━━━━━\n"
+        f"x-ui service: {xui_status}\n"
+        f"Telegram bot service: {bot_status}\n"
+        "━━━━━━━━━━━━━━━\n"
+        f"🔄 بروزرسانی: {get_jalali_now()}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# تیکت پشتیبانی — رندر پنل ادمین (بخش ۳)
+# ---------------------------------------------------------------------------
+
+async def _render_admin_tickets_list(query, page: int) -> None:
+    total = count_tickets()
+    total_pages = max(1, (total + TICKET_LIST_PAGE_SIZE - 1) // TICKET_LIST_PAGE_SIZE)
+    page = max(0, min(page, total_pages - 1))
+    offset = page * TICKET_LIST_PAGE_SIZE
+    tickets = list_tickets(limit=TICKET_LIST_PAGE_SIZE, offset=offset)
+
+    text = f"🎫 <b>تیکت‌های پشتیبانی</b> (صفحه {page + 1}/{total_pages}, مجموع {total})"
+    await _edit_admin_message(query, text, get_admin_tickets_keyboard(tickets, page, total_pages))
+
+
+async def _render_admin_ticket_detail(query, ticket_id: int, page: int) -> None:
+    ticket = get_ticket(ticket_id)
+    if not ticket:
+        await _edit_admin_message(query, "⚠️ این تیکت پیدا نشد.", get_admin_back_keyboard())
+        return
+
+    username_display = f"@{escape(ticket['username'])}" if ticket.get("username") else "بدون یوزرنیم"
+    status_label = {"open": "🟡 باز", "answered": "🟢 پاسخ داده‌شده", "closed": "⚪️ بسته"}.get(ticket["status"], ticket["status"])
+
+    text = (
+        f"🎫 <b>Ticket #{ticket_id}</b>\n\n"
+        f"User: <code>{ticket['user_id']}</code>\n"
+        f"Username: {username_display}\n"
+        f"وضعیت: {status_label}\n\n"
+        f"Message:\n{escape(ticket['message'])}"
+    )
+    if ticket.get("admin_reply"):
+        text += f"\n\n✍️ <b>پاسخ:</b>\n{escape(ticket['admin_reply'])}"
+
+    await _edit_admin_message(query, text, get_admin_ticket_detail_keyboard(ticket_id, page, ticket["status"]))
+
+
+# ---------------------------------------------------------------------------
+# آمار فروش — رندر پنل ادمین (بخش ۴)
+# ---------------------------------------------------------------------------
+
+async def _render_admin_stats(query, view: str) -> None:
+    if view == "monthly":
+        report = get_monthly_sales_report()
+        lines = [
+            "📊 <b>گزارش فروش ماهانه</b>\n",
+            f"💰 فروش ماه: {format_toman(report['revenue'])} تومان",
+            f"🛒 تعداد خرید: {report['purchase_count']}",
+            "",
+            "🏆 <b>بهترین محصولات:</b>",
+        ]
+        if report["top_products"]:
+            for p in report["top_products"]:
+                label = _product_label(p["product_key"]) if p["product_key"] else "نامشخص"
+                lines.append(f"• {escape(label)} — {p['count']} فروش — {format_toman(p['revenue'])} تومان")
+        else:
+            lines.append("چیزی ثبت نشده.")
+        lines.append("")
+        lines.append("👑 <b>بیشترین کاربران فعال:</b>")
+        if report["top_users"]:
+            for u in report["top_users"]:
+                name = u.get("username") and f"@{u['username']}" or u.get("full_name") or str(u["user_id"])
+                lines.append(f"• {escape(str(name))} — {u['count']} خرید")
+        else:
+            lines.append("چیزی ثبت نشده.")
+        text = "\n".join(lines)
+    else:
+        report = get_daily_sales_report()
+        text = (
+            "📊 <b>گزارش فروش روزانه</b>\n\n"
+            f"🛒 تعداد خرید: {report['purchase_count']}\n"
+            f"💰 درآمد: {format_toman(report['revenue'])} تومان\n"
+            f"👤 کاربران جدید: {report['new_users']}\n"
+            f"♻️ تعداد تمدید (تست): {report['renewals']}\n"
+            f"🧪 تعداد تست: {report['test_count']}\n"
+            f"📦 سرویس فعال: {report['active_services']}\n"
+            f"⌛️ سرویس منقضی: {report['expired_services']}"
+        )
+
+    await _edit_admin_message(query, text, get_admin_stats_keyboard(view))
+
+
+# ---------------------------------------------------------------------------
+# آمار Referral — رندر پنل ادمین (بخش ۶)
+# ---------------------------------------------------------------------------
+
+async def _render_admin_referrals(query, page: int) -> None:
+    total = count_users_with_invites()
+    total_pages = max(1, (total + REFERRAL_LIST_PAGE_SIZE - 1) // REFERRAL_LIST_PAGE_SIZE)
+    page = max(0, min(page, total_pages - 1))
+    offset = page * REFERRAL_LIST_PAGE_SIZE
+    stats = get_referral_stats(limit=REFERRAL_LIST_PAGE_SIZE, offset=offset)
+
+    lines = [f"🎁 <b>آمار Referral</b> (صفحه {page + 1}/{total_pages}, مجموع {total} کاربر)\n"]
+    if not stats:
+        lines.append("هنوز کسی دعوتی ثبت نکرده.")
+    else:
+        for s in stats:
+            name = (s.get("username") and f"@{s['username']}") or s.get("full_name") or str(s["user_id"])
+            lines.append(f"• {escape(str(name))} (<code>{s['user_id']}</code>) — دعوت: {s['invite_count']} — هدیه: {s['referral_rewards_given']}")
+    text = "\n".join(lines)
+
+    await _edit_admin_message(query, text, get_admin_referrals_keyboard(page, total_pages))
 
 
 async def _render_config_list(query, product_key: str, page: int) -> None:
@@ -952,11 +1561,169 @@ async def admin_config_add_message_handler(update: Update, context: ContextTypes
 
 async def admin_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    if not user or not is_admin(user.id):
+    if not user:
         return
+
+    if context.user_data.get("awaiting_ticket_message"):
+        context.user_data.pop("awaiting_ticket_message", None)
+        await update.message.reply_text(
+            "❌ ارسال تیکت لغو شد.", reply_markup=get_main_menu_keyboard(show_admin_panel=is_admin(user.id)),
+        )
+        return
+
+    if not is_admin(user.id):
+        return
+
     context.user_data.pop("awaiting_broadcast", None)
     context.user_data.pop("awaiting_config_add", None)
+    context.user_data.pop("awaiting_admin_test_target", None)
+    context.user_data.pop("awaiting_admin_ticket_reply", None)
     await update.message.reply_text("❌ عملیات لغو شد.", reply_markup=get_admin_panel_keyboard())
+
+
+# ---------------------------------------------------------------------------
+# تیکت پشتیبانی — سمت کاربر (بخش ۳)
+# ---------------------------------------------------------------------------
+
+async def ticket_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    message = update.effective_message
+
+    if not context.user_data.get("awaiting_ticket_message"):
+        return
+
+    if not message or not message.text:
+        await message.reply_text("❌ لطفاً فقط متن تیکت رو بفرست.")
+        return
+
+    text = message.text.strip()
+    if text == "/cancel":
+        context.user_data.pop("awaiting_ticket_message", None)
+        await message.reply_text("❌ ارسال تیکت لغو شد.", reply_markup=get_main_menu_keyboard(show_admin_panel=is_admin(user.id)))
+        return
+
+    context.user_data.pop("awaiting_ticket_message", None)
+    ticket_id = create_ticket(user.id, user.username, text)
+
+    await message.reply_text(
+        f"✅ تیکت شما با شماره‌ی <code>#{ticket_id}</code> ثبت شد. به‌زودی ادمین پاسخ می‌ده.",
+        parse_mode="HTML",
+        reply_markup=get_main_menu_keyboard(show_admin_panel=is_admin(user.id)),
+    )
+
+    username_display = f"@{escape(user.username)}" if user.username else "بدون یوزرنیم"
+    admin_text = (
+        f"🎫 <b>Ticket #{ticket_id}</b>\n\n"
+        f"User: {escape(user.first_name or '')}\n"
+        f"ID: <code>{user.id}</code>\n"
+        f"Username: {username_display}\n\n"
+        f"Message:\n{escape(text)}"
+    )
+    try:
+        await context.bot.send_message(
+            chat_id=ADMIN_ID, text=admin_text, parse_mode="HTML",
+            reply_markup=get_admin_ticket_detail_keyboard(ticket_id, 0, "open"),
+        )
+    except TelegramError as e:
+        logger.error("Could not notify admin about ticket %s: %s", ticket_id, e, exc_info=True)
+
+
+# ---------------------------------------------------------------------------
+# اکانت تست — سمت ادمین: ساخت برای یک کاربر مشخص (بخش ۱)
+# ---------------------------------------------------------------------------
+
+async def admin_test_target_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    message = update.effective_message
+
+    if not user or not is_admin(user.id):
+        return
+    if not context.user_data.get("awaiting_admin_test_target"):
+        return
+
+    if not message or not message.text:
+        await message.reply_text("❌ فقط آیدی عددی تلگرام کاربر رو بفرست.")
+        return
+
+    text = message.text.strip()
+    if text == "/cancel":
+        context.user_data.pop("awaiting_admin_test_target", None)
+        await message.reply_text("❌ لغو شد.", reply_markup=get_admin_panel_keyboard())
+        return
+
+    if not text.lstrip("-").isdigit():
+        await message.reply_text("❌ آیدی نامعتبره. فقط عدد (Telegram ID) بفرست، یا /cancel برای لغو.")
+        return
+
+    target_user_id = int(text)
+    context.user_data.pop("awaiting_admin_test_target", None)
+
+    target_db_user = get_user_by_id(target_user_id)
+    target_username = target_db_user.get("username") if target_db_user else None
+
+    await message.reply_text("⏳ در حال ساخت اکانت تست...")
+    result = await _create_and_deliver_test_account(context, target_user_id, target_username, created_by_admin=True)
+    if result is None:
+        await message.reply_text("❌ ساخت اکانت تست ناموفق بود (پیام خطا بالاتر ارسال شد).", reply_markup=get_admin_panel_keyboard())
+        return
+
+    await message.reply_text(
+        f"✅ اکانت تست برای <code>{target_user_id}</code> ساخته و ارسال شد.",
+        parse_mode="HTML",
+        reply_markup=get_admin_panel_keyboard(),
+    )
+
+
+# ---------------------------------------------------------------------------
+# تیکت پشتیبانی — سمت ادمین: پاسخ دادن (بخش ۳)
+# ---------------------------------------------------------------------------
+
+async def admin_ticket_reply_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    message = update.effective_message
+
+    if not user or not is_admin(user.id):
+        return
+    pending = context.user_data.get("awaiting_admin_ticket_reply")
+    if not pending:
+        return
+
+    if not message or not message.text:
+        await message.reply_text("❌ فقط متن پاسخ رو بفرست.")
+        return
+
+    text = message.text.strip()
+    if text == "/cancel":
+        context.user_data.pop("awaiting_admin_ticket_reply", None)
+        await message.reply_text("❌ لغو شد.", reply_markup=get_admin_panel_keyboard())
+        return
+
+    ticket_id = pending["ticket_id"]
+    ticket = get_ticket(ticket_id)
+    context.user_data.pop("awaiting_admin_ticket_reply", None)
+
+    if not ticket:
+        await message.reply_text("⚠️ این تیکت دیگر وجود ندارد.", reply_markup=get_admin_panel_keyboard())
+        return
+
+    set_ticket_reply(ticket_id, text)
+
+    try:
+        await context.bot.send_message(
+            chat_id=ticket["user_id"],
+            text=f"✍️ <b>پاسخ پشتیبانی به تیکت #{ticket_id}:</b>\n\n{escape(text)}",
+            parse_mode="HTML",
+        )
+        delivered = True
+    except TelegramError as e:
+        logger.error("Could not deliver ticket reply to user %s: %s", ticket["user_id"], e, exc_info=True)
+        delivered = False
+
+    status_note = "✅ برای کاربر ارسال شد." if delivered else "⚠️ ارسال برای کاربر ناموفق بود (شاید ربات را بلاک کرده)."
+    await message.reply_text(
+        f"✅ پاسخ تیکت #{ticket_id} ثبت شد.\n{status_note}",
+        reply_markup=get_admin_panel_keyboard(),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -994,7 +1761,7 @@ async def _button_handler_impl(update: Update, context: ContextTypes.DEFAULT_TYP
             await mark_and_answer("❌ هنوز عضو کانال نشدی!", alert=True)
             return None
 
-        get_or_create_user(user_id, user.username, full_name)
+        await _finalize_new_user(update, context, user, full_name)
         first_name = escape(user.first_name or "داداش")
         welcome_text = (
             f"✅ خوش اومدی <b>{first_name}</b>! عضویتت تأیید شد.\n\n"
@@ -1033,6 +1800,19 @@ async def _button_handler_impl(update: Update, context: ContextTypes.DEFAULT_TYP
         await delete_message_safe(query)
         await send_new_message(update, context, text="☎️ در دکمه زیر ( سوالات متداول ) سوالات پرتکرار شما آمده است.", reply_markup=get_support_keyboard())
         return None
+
+    if data == "ticket_new":
+        context.user_data["awaiting_ticket_message"] = True
+        await delete_message_safe(query)
+        await send_new_message(
+            update, context,
+            text="🆘 <b>ارسال تیکت پشتیبانی</b>\n\nمشکل یا سوالت رو توی یک پیام بنویس و بفرست؛ به‌زودی ادمین جواب می‌ده.",
+            reply_markup=get_ticket_cancel_keyboard(),
+        )
+        return None
+
+    if data == "referral_info":
+        return await _handle_referral_info(update, context, query, user_id)
 
     if data == "faq":
         faq_text = (
@@ -1189,8 +1969,116 @@ async def _edit_order_message(query, caption: str) -> None:
             pass
 
 
+async def _create_and_deliver_test_account(
+    context: ContextTypes.DEFAULT_TYPE,
+    target_user_id: int,
+    target_username: Optional[str],
+    created_by_admin: bool = False,
+) -> Optional[dict]:
+    """
+    یک اکانت تست واقعی و زنده در x-ui می‌سازد (بخش ۱) و لینک را برای
+    ``target_user_id`` ارسال می‌کند. هم از دکمه‌ی «اکانت تست» کاربر عادی و
+    هم از پنل ادمین («ساخت تست برای کاربر») استفاده می‌شود.
+    خروجی: دیکشنری سرویس ساخته‌شده یا None در صورت خطا (که خودش پیام خطا می‌فرستد).
+    """
+    try:
+        created = await asyncio.to_thread(
+            xui_api.create_client,
+            "test",
+            target_user_id,
+            TEST_ACCOUNT_DURATION_HOURS / 24.0,
+            TEST_ACCOUNT_VOLUME_GB,
+            f"test-{target_user_id}",
+        )
+    except xui_api.XUIAPIError as e:
+        logger.error("Test-account creation failed for %s: %s", target_user_id, e, exc_info=True)
+        await context.bot.send_message(
+            chat_id=target_user_id if not created_by_admin else ADMIN_ID,
+            text=f"❌ ساخت اکانت تست ناموفق بود:\n<code>{escape(str(e))}</code>",
+            parse_mode="HTML",
+        )
+        return None
+
+    if not created["link"]:
+        await notify_admin(
+            context,
+            f"⚠️ کلاینت تست برای <code>{target_user_id}</code> در x-ui ساخته شد ولی لینک subscription "
+            "خالی بود (تنظیمات subscription پنل را بررسی کن).",
+        )
+
+    mark_test_account_used(target_user_id)
+
+    size_label = f"{TEST_ACCOUNT_VOLUME_GB:g} گیگابایت" if TEST_ACCOUNT_VOLUME_GB else "نامحدود"
+    service_id = create_user_service(
+        user_id=target_user_id,
+        username=target_username,
+        service_type="test",
+        product_key="test_config",
+        config_id=None,
+        link=created["link"] or "",
+        size=size_label,
+        duration_days=TEST_ACCOUNT_DURATION_HOURS / 24.0,
+        kind="test",
+        xui_client_uuid=created["uuid_or_password"],
+        xui_inbound_id=created["inbound_id"],
+        xui_email=created["email"],
+        total_bytes=created["total_bytes"],
+        expiry_ms=created["expiry_ms"],
+        protocol=created["protocol"],
+    )
+
+    await notify_admin_test_account(context, _ShimUser(target_user_id, target_username), service_id)
+    await notify_admin_service_delivered(
+        context, target_user_id, target_username, "test_config", "اکانت تست",
+        service_id, service_type="تستی",
+    )
+
+    caption = (
+        "🎁 <b>سرویس تست شما فعال شد!</b>\n"
+        "━━━━━━━━━━━━━━━\n"
+        f"👤 <b>نام کاربری:</b> <code>{target_user_id}_test</code>\n"
+        "🌿 <b>نوع:</b> تست رایگان (FREE_TEST)\n"
+        f"🌍 <b>لوکیشن:</b> {SERVICE_LOCATION_LABEL}\n"
+        f"⏳ <b>مدت:</b> {TEST_ACCOUNT_DURATION_HOURS} ساعت\n"
+        f"🗜 <b>حجم:</b> {size_label}\n"
+        "━━━━━━━━━━━━━━━\n\n"
+        f"🔗 <code>{created['link'] or 'در حال آماده‌سازی — از ادمین بپرس'}</code>"
+    )
+
+    reply_markup = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📚 آموزش اتصال", callback_data="tutorial")],
+        [InlineKeyboardButton("🏠 منوی اصلی", callback_data="main_menu")],
+    ])
+
+    sent_message = None
+    try:
+        if created["link"]:
+            qr_bio = generate_qr_code(created["link"])
+            sent_message = await context.bot.send_photo(
+                chat_id=target_user_id, photo=qr_bio, caption=caption,
+                parse_mode="HTML", reply_markup=reply_markup,
+            )
+        else:
+            sent_message = await context.bot.send_message(
+                chat_id=target_user_id, text=caption, parse_mode="HTML", reply_markup=reply_markup,
+            )
+    except Exception as e:
+        print(f"Could not send test-account message for {target_user_id}: {e}")
+
+    if sent_message is not None:
+        try:
+            await context.bot.pin_chat_message(
+                chat_id=target_user_id, message_id=sent_message.message_id, disable_notification=True,
+            )
+        except TelegramError as e:
+            print(f"Could not pin test-account message for {target_user_id}: {e}")
+
+    return {"service_id": service_id, **created}
+
+
 async def _handle_test_account(update, context, query, user, user_id, mark_and_answer):
-    if has_used_test_account(user_id):
+    # قانون: کاربر عادی فقط یک‌بار (بر اساس Telegram ID)؛ ادمین محدودیت ندارد.
+    if not is_admin(user_id) and has_used_test_account(user_id):
         await delete_message_safe(query)
         await send_new_message(
             update, context,
@@ -1202,77 +2090,15 @@ async def _handle_test_account(update, context, query, user, user_id, mark_and_a
         )
         return None
 
-    test_config = get_available_config("test_config")
-    if not test_config:
-        await delete_message_safe(query)
+    await mark_and_answer("⏳ در حال ساخت اکانت تست...")
+    await delete_message_safe(query)
+    result = await _create_and_deliver_test_account(context, user_id, user.username)
+    if result is None:
         await send_new_message(
             update, context,
-            text="در حال حاضر سرویس تست به اتمام رسیده. ⏱",
+            text="❌ متاسفانه در ساخت اکانت تست مشکلی پیش اومد. لطفاً کمی بعد دوباره امتحان کن یا با پشتیبانی تماس بگیر.",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 منوی اصلی", callback_data="main_menu")]]),
         )
-        return None
-
-    mark_test_account_used(user_id)
-    mark_config_sold(test_config["id"])
-
-    create_user_service(
-        user_id=user_id,
-        username=user.username,
-        service_type="test",
-        product_key="test_config",
-        config_id=test_config["id"],
-        link=test_config["link"],
-        size="100 مگابایت",
-        duration_days=1,
-    )
-
-    await notify_admin_test_account(context, user, test_config["id"])
-    await notify_admin_service_delivered(
-        context, user_id, user.username, "test_config", "اکانت تست",
-        test_config["id"], service_type="تستی",
-    )
-
-    caption = (
-        "🎁 <b>سرویس تست شما فعال شد!</b>\n"
-        "━━━━━━━━━━━━━━━\n"
-        f"👤 <b>نام کاربری:</b> <code>{user_id}_test</code>\n"
-        "🌿 <b>نوع:</b> تست رایگان\n"
-        "🇳🇱 <b>لوکیشن:</b> Netherlands\n"
-        "⏳ <b>مدت:</b> 24 ساعت\n"
-        "🗜 <b>حجم:</b> 100 مگابایت\n"
-        "━━━━━━━━━━━━━━━\n\n"
-        f"🔗 <code>{test_config['link']}</code>"
-    )
-    await delete_message_safe(query)
-
-    sent_message = None
-    try:
-        qr_bio = generate_qr_code(test_config["link"])
-        sent_message = await context.bot.send_photo(
-            chat_id=user_id,
-            photo=qr_bio,
-            caption=caption,
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("📚 آموزش اتصال", callback_data="tutorial")],
-                [InlineKeyboardButton("🏠 منوی اصلی", callback_data="main_menu")],
-            ]),
-        )
-    except Exception as e:
-        print(f"Could not generate/send QR code for {user_id}: {e}")
-        sent_message = await send_new_message(update, context, text=caption, reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("📚 آموزش اتصال", callback_data="tutorial")],
-            [InlineKeyboardButton("🏠 منوی اصلی", callback_data="main_menu")],
-        ]))
-
-    if sent_message is not None:
-        try:
-            await context.bot.pin_chat_message(
-                chat_id=user_id, message_id=sent_message.message_id, disable_notification=True,
-            )
-        except TelegramError as e:
-            print(f"Could not pin test-account message for {user_id}: {e}")
-
     return None
 
 
@@ -1334,6 +2160,8 @@ async def _resolve_xui_email(svc: dict) -> Optional[str]:
 async def _render_service_detail_text(svc: dict) -> str:
     if svc["service_type"] == "test":
         service_username = f"{svc['user_id']}_test"
+    elif svc.get("config_id") is None:
+        service_username = f"{svc['user_id']}_{svc.get('kind') or 'live'}"
     else:
         service_username = f"{svc['user_id']}_{svc['config_id']}"
 
@@ -1422,6 +2250,32 @@ async def _handle_wallet_profile(update, context, query, user_id, full_name, db_
     )
     await delete_message_safe(query)
     await send_new_message(update, context, text=text, reply_markup=get_wallet_keyboard())
+    return None
+
+
+async def _handle_referral_info(update, context, query, user_id):
+    db_user = get_user_by_id(user_id) or get_or_create_user(user_id, None, "کاربر")
+    ref_code = db_user.get("referral_code") or ""
+    bot_username = (await context.bot.get_me()).username
+    invite_link = f"https://t.me/{bot_username}?start={ref_code}" if bot_username else ref_code
+
+    invite_count = get_invite_count(user_id)
+    rewards_given = get_referral_rewards_given(user_id)
+    remaining = REFERRAL_REQUIRED_INVITES - (invite_count % REFERRAL_REQUIRED_INVITES)
+    if invite_count % REFERRAL_REQUIRED_INVITES == 0 and invite_count > 0 and rewards_given * REFERRAL_REQUIRED_INVITES == invite_count:
+        remaining = REFERRAL_REQUIRED_INVITES
+
+    text = (
+        "🎯 <b>دعوت دوستان</b>\n\n"
+        f"هر <b>{REFERRAL_REQUIRED_INVITES} نفر</b> که با لینک اختصاصی شما برای اولین‌بار وارد ربات بشن، "
+        f"یک اشتراک <b>{escape(REFERRAL_GIFT_LABEL)}</b> کاملاً رایگان بهتون هدیه داده می‌شه! 🎁\n\n"
+        f"🔗 <b>لینک دعوت شما:</b>\n<code>{escape(invite_link)}</code>\n\n"
+        f"👥 دعوت‌های موفق: <b>{invite_count}</b>\n"
+        f"🎁 هدایای دریافتی: <b>{rewards_given}</b>\n"
+        f"⏳ تا هدیه‌ی بعدی: <b>{remaining}</b> نفر دیگه"
+    )
+    await delete_message_safe(query)
+    await send_new_message(update, context, text=text, reply_markup=get_referral_info_keyboard())
     return None
 
 
@@ -1782,6 +2636,16 @@ async def debug_get_chat_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if context.user_data.get("awaiting_config_add"):
             await admin_config_add_message_handler(update, context)
             return
+        if context.user_data.get("awaiting_admin_test_target"):
+            await admin_test_target_handler(update, context)
+            return
+        if context.user_data.get("awaiting_admin_ticket_reply"):
+            await admin_ticket_reply_handler(update, context)
+            return
+
+    if context.user_data.get("awaiting_ticket_message"):
+        await ticket_message_handler(update, context)
+        return
 
     if message and message.text and contains_profanity(message.text):
         await message.reply_text("خودتی 🖕")
