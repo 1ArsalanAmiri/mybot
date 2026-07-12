@@ -143,7 +143,12 @@ def _api_post(path: str, json_body: dict) -> dict:
     session = _get_session()
     url = _base_url() + path.lstrip("/")
     try:
-        resp = session.post(url, json=json_body, timeout=15)
+        resp = session.post(
+            url,
+            json=json_body,
+            timeout=15,
+            verify=False
+        )
     except requests.RequestException as e:
         raise XUIAPIError(f"درخواست به پنل x-ui ناموفق بود ({path}): {e}") from e
 
@@ -153,7 +158,12 @@ def _api_post(path: str, json_body: dict) -> dict:
         _session = None
         session = _get_session()
         try:
-            resp = session.post(url, json=json_body, timeout=15)
+            resp = session.post(
+                url,
+                json=json_body,
+                timeout=15,
+                verify=False
+            )
         except requests.RequestException as e:
             raise XUIAPIError(f"درخواست به پنل x-ui بعد از لاگین مجدد هم ناموفق بود ({path}): {e}") from e
 
@@ -172,7 +182,11 @@ def _api_get(path: str) -> dict:
     session = _get_session()
     url = _base_url() + path.lstrip("/")
     try:
-        resp = session.get(url, timeout=15)
+        resp = session.get(
+            url,
+            timeout=15,
+            verify=False
+        )
     except requests.RequestException as e:
         raise XUIAPIError(f"درخواست GET به پنل x-ui ناموفق بود ({path}): {e}") from e
     try:
