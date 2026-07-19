@@ -33,6 +33,7 @@ import requests
 
 from config import (
     XUI_PANEL_URL,
+    XUI_VERIFY_SSL,
     XUI_PANEL_USERNAME,
     XUI_PANEL_PASSWORD,
     TEST_ACCOUNT_INBOUND_ID,
@@ -76,7 +77,7 @@ def _get_session() -> requests.Session:
         page = session.get(
             _base_url(),
             timeout=15,
-            verify=False
+            verify=XUI_VERIFY_SSL
         )
 
         csrf_match = re.search(
@@ -102,7 +103,7 @@ def _get_session() -> requests.Session:
             },
             headers=headers,
             timeout=15,
-            verify=False
+            verify=XUI_VERIFY_SSL
         )
 
 
@@ -143,7 +144,7 @@ def _api_post(path: str, json_body: dict) -> dict:
             url,
             json=json_body,
             timeout=15,
-            verify=False
+            verify=XUI_VERIFY_SSL
         )
     except requests.RequestException as e:
         raise XUIAPIError(f"درخواست به پنل x-ui ناموفق بود ({path}): {e}") from e
@@ -158,7 +159,7 @@ def _api_post(path: str, json_body: dict) -> dict:
                 url,
                 json=json_body,
                 timeout=15,
-                verify=False
+                verify=XUI_VERIFY_SSL
             )
         except requests.RequestException as e:
             raise XUIAPIError(f"درخواست به پنل x-ui بعد از لاگین مجدد هم ناموفق بود ({path}): {e}") from e
@@ -181,7 +182,7 @@ def _api_get(path: str) -> dict:
         resp = session.get(
             url,
             timeout=15,
-            verify=False
+            verify=XUI_VERIFY_SSL
         )
     except requests.RequestException as e:
         raise XUIAPIError(f"درخواست GET به پنل x-ui ناموفق بود ({path}): {e}") from e

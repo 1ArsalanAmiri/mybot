@@ -333,7 +333,10 @@ async def _deliver_product(
         await context.bot.pin_chat_message(
             chat_id=customer_id, message_id=sent_message.message_id, disable_notification=True,
         )
-    except TelegramError as e:
+    except Exception as e:
+        # قبلاً فقط TelegramError گرفته می‌شد؛ حالا هر خطای غیرمنتظره‌ای هم
+        # (مثلاً asyncio.TimeoutError یا خطای شبکه‌ی دیگر) گرفته می‌شود چون
+        # پین‌نشدن پیام هرگز نباید کل تحویل سرویس را کرش کند.
         print(f"Could not pin service-delivered message for {customer_id}: {e}")
 
     await notify_admin_service_delivered(
@@ -1301,22 +1304,49 @@ def _build_server_monitor_text() -> str:
     except ImportError:
         return "⚠️ کتابخانه‌ی psutil نصب نیست. روی سرور اجرا کن: pip install psutil --break-system-packages"
 
-    cpu_percent = psutil.cpu_percent(interval=1)
-    ram = psutil.virtual_memory()
-    disk = psutil.disk_usage("/")
-    uptime_seconds = int(time.time() - psutil.boot_time())
+    # قبلاً فقط ImportError گرفته می‌شد؛ اما psutil در برخی محیط‌ها (کانتینر
+    # بدون دسترسی /proc، سطح دسترسی محدود سیستم‌عامل، دیسک‌های عجیب و ...)
+    # می‌تواند در زمان اجرا هم PermissionError/OSError/RuntimeError بدهد.
+    # طبق درخواست: کل این بخش باید یک try-except سراسری داشته باشد تا خطای
+    # psutil هرگز کل ربات یا حتی همین پنل ادمین را متوقف نکند.
+    try:
+        cpu_percent = psutil.cpu_percent(interval=1)
+        ram = psutil.virtual_memory()
+        disk = psutil.disk_usage("/")
+        uptime_seconds = int(time.time() - psutil.boot_time())
+    except Exception as e:
+        logger.error("psutil failed while building server monitor text: %s", e, exc_info=True)
+        return (
+            "⚠️ <b>خواندن اطلاعات سرور با خطا مواجه شد.</b>\n"
+            f"جزئیات فنی در لاگ ربات ثبت شد.\n\n"
+            f"🔄 بروزرسانی: {get_jalali_now()}"
+        )
 
     try:
         log_server_stats(cpu_percent, ram.percent, disk.percent, uptime_seconds)
     except Exception as e:
         logger.error("log_server_stats failed: %s", e, exc_info=True)
 
-    client_counts = xui_db.count_clients()
-    total_active_services = count_active_user_services()
-    expired_services = count_expired_services()
+    try:
+        client_counts = xui_db.count_clients()
+    except Exception as e:
+        logger.error("xui_db.count_clients failed: %s", e, exc_info=True)
+        client_counts = {"active": "؟", "total": "؟"}
 
-    xui_status = _systemd_status(XUI_SERVICE_NAME)
-    bot_status = _systemd_status(BOT_SERVICE_NAME) if BOT_SERVICE_NAME else "تنظیم نشده (BOT_SERVICE_NAME در config.py)"
+    try:
+        total_active_services = count_active_user_services()
+        expired_services = count_expired_services()
+    except Exception as e:
+        logger.error("counting services failed: %s", e, exc_info=True)
+        total_active_services = "؟"
+        expired_services = "؟"
+
+    try:
+        xui_status = _systemd_status(XUI_SERVICE_NAME)
+        bot_status = _systemd_status(BOT_SERVICE_NAME) if BOT_SERVICE_NAME else "تنظیم نشده (BOT_SERVICE_NAME در config.py)"
+    except Exception as e:
+        logger.error("_systemd_status failed: %s", e, exc_info=True)
+        xui_status = bot_status = "؟ (خطا در بررسی وضعیت سرویس)"
 
     return (
         f"🖥 <b>{escape(SERVER_DISPLAY_LABEL)}</b>\n"
@@ -2070,7 +2100,7 @@ async def _create_and_deliver_test_account(
             await context.bot.pin_chat_message(
                 chat_id=target_user_id, message_id=sent_message.message_id, disable_notification=True,
             )
-        except TelegramError as e:
+        except Exception as e:
             print(f"Could not pin test-account message for {target_user_id}: {e}")
 
     return {"service_id": service_id, **created}

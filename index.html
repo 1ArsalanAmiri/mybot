@@ -1,0 +1,1057 @@
+3X-UI Panel API
+ 3.x 
+OAS 3.0
+/0GkPc07EAkdveTF8QK/panel/api/openapi.json
+Programmatic interface to a 3X-UI panel. Authenticate either by logging in (cookie) or with an API token from Settings → Security → API Token (Bearer). All endpoints under /panel/api/* honour both modes — an API token is a full-admin credential, so treat it like the panel password.
+
+Servers
+
+/0GkPc07EAkdveTF8QK - Current panel
+
+Authorize
+Authentication
+Two authentication modes are supported. UI sessions use a cookie set by the login endpoint. Programmatic clients (bots, scripts, remote panels) authenticate with a Bearer token taken from Settings → Security → API Token. Both work for every endpoint under /panel/api/*.
+
+
+
+POST
+/login
+Authenticate with username + password and receive a session cookie. Required before any cookie-based API call.
+
+
+
+POST
+/logout
+Clear the session cookie. Requires the CSRF header for browser sessions.
+
+
+
+GET
+/csrf-token
+Mint a CSRF token for the current session. The SPA replays it in the X-CSRF-Token header on unsafe requests. Bearer-token callers can skip this — the middleware short-circuits CSRF for authenticated API requests.
+
+
+
+POST
+/getTwoFactorEnable
+Returns whether 2FA is enabled on the panel — used by the login page to decide whether to show the OTP field.
+
+
+Inbounds
+Manage inbound configurations and their clients. All endpoints live under /panel/api/inbounds and require a logged-in session or Bearer token. Link-generating endpoints honour forwarded headers only when the request comes from a configured trusted proxy.
+
+
+
+GET
+/panel/api/inbounds/list
+List every inbound owned by the authenticated user, including each inbound’s clientStats traffic counters. settings, streamSettings, and sniffing are returned as nested JSON objects (no escaped strings); legacy callers that send them back as JSON-encoded strings are still accepted on write.
+
+
+
+GET
+/panel/api/inbounds/list/slim
+Same shape as /list but with settings.clients[] stripped down to {email, enable, comment} and ClientStats not enriched with UUID/SubId. Use this for list pages; fetch /get/:id when you need the full per-client payload (uuid, password, flow, ...).
+
+
+
+GET
+/panel/api/inbounds/options
+Lightweight picker projection of the authenticated user’s inbounds. Returns id, remark, tag, protocol, port, a server-computed tlsFlowCapable flag (true for VLESS on TCP with tls or reality, or on XHTTP with VLESS encryption / vlessenc enabled), and ssMethod (the Shadowsocks cipher, empty for non-Shadowsocks inbounds — used by the client UI to generate a valid Shadowsocks 2022 PSK). Use this for dropdowns and attach pickers — it skips settings, streamSettings, and clientStats so the payload stays small even on panels with thousands of clients.
+
+
+
+GET
+/panel/api/inbounds/allLinks
+Return every protocol URL (vless://, vmess://, trojan://, ss://, hysteria://, mtproto) across all inbounds and all of their clients. Links are rendered through the subscription engine, so the configured remark template (name-only display part) is applied per client — the same output the client info/QR pages use. Protocols without a URL form (socks, http, mixed, wireguard, dokodemo, tunnel) contribute nothing. Used by the panel’s "Export all inbound links" action.
+
+
+
+GET
+/panel/api/inbounds/get/{id}
+Fetch a single inbound by numeric ID.
+
+
+
+POST
+/panel/api/inbounds/add
+Create a new inbound. Send the full inbound payload (protocol, port, settings, streamSettings, sniffing, remark, expiryTime, total, enable). settings, streamSettings, and sniffing may be sent as nested JSON objects (preferred) or as JSON-encoded strings (legacy).
+
+
+
+POST
+/panel/api/inbounds/del/{id}
+Delete an inbound by ID. Also removes its associated client stats rows.
+
+
+
+POST
+/panel/api/inbounds/bulkDel
+Delete many inbounds in one call. Processes the list sequentially; failures are reported per id and the rest still proceed. Restarts xray at most once.
+
+
+
+POST
+/panel/api/inbounds/update/{id}
+Replace an inbound’s configuration. Body shape mirrors /add. Heavy on inbounds with thousands of clients — prefer /setEnable for enable-only flips.
+
+
+
+POST
+/panel/api/inbounds/setEnable/{id}
+Toggle only the enable flag without serialising the whole settings JSON. Recommended for UI switches on large inbounds.
+
+
+
+POST
+/panel/api/inbounds/{id}/resetTraffic
+Zero out upload + download counters for a single inbound. Does not touch per-client counters.
+
+
+
+POST
+/panel/api/inbounds/{id}/delAllClients
+Remove every client attached to a single inbound while keeping the inbound itself. Collects emails from settings.clients[] and feeds them into the optimized bulk-delete path (runtime user removal + traffic-row cleanup + SyncInbound). Destructive and cannot be undone.
+
+
+
+POST
+/panel/api/inbounds/resetAllTraffics
+Reset upload + download counters on every inbound. Destructive — accounting history is lost.
+
+
+
+POST
+/panel/api/inbounds/import
+Bulk-import an inbound from a JSON blob (e.g. one exported via the UI). The body uses form encoding with a single "data" field.
+
+
+
+POST
+/panel/api/inbounds/pushClientTraffics
+Receive a master panel's aggregated per-client usage, keyed by the master's GUID. Stored in a side table used only for the UI display overlay and local quota enforcement — never folded into the local counters that masters poll, so delta accounting stays intact. Called panel-to-panel by the node traffic sync job.
+
+
+
+GET
+/panel/api/inbounds/{id}/fallbacks
+List the fallback rules attached to a master VLESS/Trojan TCP-TLS inbound. Each rule links one child inbound (the dest) to optional SNI/ALPN/path/dest/xver match criteria. When dest is empty the child inbound's listen+port is used.
+
+
+
+POST
+/panel/api/inbounds/{id}/fallbacks
+Replace the entire fallback list for a master inbound. Body is JSON. Triggers an Xray restart.
+
+
+Server
+System status, log retrieval, certificate generators, Xray binary management, and backup/restore. All under /panel/api/server.
+
+
+
+GET
+/panel/api/server/status
+Real-time machine snapshot: CPU, memory, swap, disk, network IO, load averages, open connections, Xray state. Cached and refreshed every 2 seconds in the background.
+
+
+
+GET
+/panel/api/server/fail2banStatus
+Reports whether per-client IP limits can be enforced on this host. The panel uses it to gate the "IP Limit" field, since enforcement depends on Fail2ban being installed.
+
+
+
+GET
+/panel/api/server/cpuHistory/{bucket}
+Legacy: aggregated CPU history. Use /history/cpu/:bucket instead — same data with a uniform {t, v} shape.
+
+
+
+GET
+/panel/api/server/history/{metric}/{bucket}
+Aggregated time-series for one metric. Returns an array of {t, v} samples covering the last ~6 hours.
+
+
+
+GET
+/panel/api/server/xrayMetricsState
+Xray runtime metrics state — whether the xray config has a `metrics` block, which expvar keys are flowing, and the current snapshot values for each. Returns an empty state when metrics are not configured.
+
+
+
+GET
+/panel/api/server/xrayMetricsHistory/{metric}/{bucket}
+Time-series history for one Xray runtime metric over the last ~6 hours. Same {t, v} shape as /history/:metric/:bucket.
+
+
+
+GET
+/panel/api/server/xrayObservatory
+Latest snapshot from the Xray observatory — per-outbound latency, health status, and last-probe time. Only populated when the Xray config has an observatory configured.
+
+
+
+GET
+/panel/api/server/xrayObservatoryHistory/{tag}/{bucket}
+Time-series of observatory probe results for one outbound tag. Same {t, v} shape as the other history endpoints.
+
+
+
+GET
+/panel/api/server/getXrayVersion
+List Xray binary versions available for install on this host.
+
+
+
+GET
+/panel/api/server/getPanelUpdateInfo
+Check whether a newer 3x-ui release is available on GitHub.
+
+
+
+GET
+/panel/api/server/getUpdateStatus
+Report the outcome of the most recently launched panel self-update (see POST updatePanel). Compare the returned runId against the one updatePanel returned to tell this run apart from a stale result.
+
+
+
+GET
+/panel/api/server/getConfigJson
+Return the assembled Xray config that’s currently running on this host.
+
+
+
+GET
+/panel/api/server/getDb
+Stream a full database backup as an attachment: the SQLite .db file on SQLite panels, or a pg_dump custom-format archive (.dump) on PostgreSQL panels. Use as a manual backup.
+
+
+
+GET
+/panel/api/server/getMigration
+Stream a cross-engine migration file as an attachment: a .dump (SQL text) on SQLite, or a .db SQLite database built from the live data on PostgreSQL.
+
+
+
+GET
+/panel/api/server/getNewUUID
+Generate a fresh UUID v4. Convenience helper for client IDs.
+
+
+
+GET
+/panel/api/server/getWebCertFiles
+Return this panel's own web TLS certificate and key file paths. The central panel calls it on a node (via the node API token) so "Set Cert from Panel" fills a node-assigned inbound with paths that exist on the node.
+
+
+
+GET
+/panel/api/server/descendants
+Read-only summaries (guid, parentGuid, name, address, status, versions) of the nodes this panel manages. A parent panel calls it on a node (via the node API token) to surface transitive sub-nodes in a chained topology. Counts are computed by the parent, not returned here.
+
+
+
+GET
+/panel/api/server/getNewX25519Cert
+Generate a new X25519 keypair for Reality.
+
+
+
+GET
+/panel/api/server/getNewmldsa65
+Generate a new ML-DSA-65 keypair (post-quantum signature). Returns {privateKey, publicKey, seed}.
+
+
+
+GET
+/panel/api/server/getNewmlkem768
+Generate a new ML-KEM-768 keypair (post-quantum KEM). Returns {clientKey, serverKey}.
+
+
+
+GET
+/panel/api/server/getNewVlessEnc
+Generate VLESS encryption auth options. Returns an auths array each with id, label, encryption, and decryption fields.
+
+
+
+POST
+/panel/api/server/stopXrayService
+Stop the Xray binary. All proxies go offline immediately.
+
+
+
+POST
+/panel/api/server/restartXrayService
+Reload Xray with the current config. Typically required after structural inbound or routing changes.
+
+
+
+POST
+/panel/api/server/installXray/{version}
+Download and install the specified Xray version. Pass "latest" for the newest release.
+
+
+
+POST
+/panel/api/server/updatePanel
+Self-update the panel to the latest version. The server restarts on success.
+
+
+
+POST
+/panel/api/server/setUpdateChannel
+Toggle the panel update channel between stable and the rolling per-commit dev release. Only effective on dev builds.
+
+
+
+POST
+/panel/api/server/updateGeofile
+Refresh the default GeoIP / GeoSite data files. Body can include a fileName, or use the /:fileName variant.
+
+
+
+POST
+/panel/api/server/updateGeofile/{fileName}
+Refresh a single Geo file by filename (e.g. geoip.dat, geosite.dat).
+
+
+
+POST
+/panel/api/server/logs/{count}
+Return the last N lines of the panel’s own log.
+
+
+
+POST
+/panel/api/server/xraylogs/{count}
+Return the last N lines of the Xray process log.
+
+
+
+POST
+/panel/api/server/importDB
+Restore the panel DB from an uploaded backup (multipart form, field name "db"). SQLite panels accept a SQLite database (.db) or a SQLite migration dump (.dump); PostgreSQL panels accept a pg_dump archive (.dump), a SQLite database (.db), or a SQLite migration dump. The panel restarts after restore. Destructive.
+
+
+
+POST
+/panel/api/server/getNewEchCert
+Generate a new ECH (Encrypted Client Hello) keypair and config list for the given SNI.
+
+
+
+POST
+/panel/api/server/getCertHash
+Compute the hex SHA-256 of a certificate (DER) for pinning (pinnedPeerCertSha256). Provide either a server file path or inline PEM/DER content.
+
+
+
+POST
+/panel/api/server/getRemoteCertHash
+Run `xray tls ping` against a remote server and return its live leaf-certificate SHA-256 hash(es) for pinning (pinnedPeerCertSha256).
+
+
+
+POST
+/panel/api/server/scanRealityTarget
+Run a live TLS 1.3 probe against a candidate REALITY target and return a feasibility verdict (TLS 1.3 + h2 + X25519 + trusted certificate) plus the certificate SAN DNS names.
+
+
+
+POST
+/panel/api/server/scanRealityTargets
+Probe/discover REALITY targets and return each verdict ranked by feasibility then latency. Each comma-separated token may be a domain (validated with SNI), a bare IP, or a CIDR range (discovered without SNI by reading the certificate domain). When empty, a built-in seed list is probed.
+
+
+
+GET
+/panel/api/server/clientIps
+Fetch the fully aggregated inbound_client_ips database table. Used by nodes to sync recently active IPs across the cluster.
+
+
+
+POST
+/panel/api/server/clientIps
+Submit a list of recently active IP timestamps. The panel merges them with the existing database to maintain a unified global IP-limit view.
+
+
+Clients
+Manage clients as first-class entities that can be attached to one or more inbounds. A single client row drives the settings.clients entry in every inbound it belongs to. Endpoints live under /panel/api/clients.
+
+
+
+GET
+/panel/api/clients/list
+List every client with its attached inbound IDs and traffic record. The reverse field, if set, is returned as a nested JSON object (legacy JSON-encoded-string form is still accepted on write).
+
+
+
+GET
+/panel/api/clients/list/paged
+Filter, sort, and paginate clients on the server. Each item is a slim row (no uuid/password/auth/flow/security/reverse/tgId) so the clients page can ship 25-ish rows in a few KB instead of the full table. The response also includes a summary computed across the full DB row set so dashboard counters stay stable as the user paginates or filters. Page size capped at 200; fetch /get/:email to obtain the full per-client payload for an edit/info modal.
+
+
+
+GET
+/panel/api/clients/get/{email}
+Fetch one client by email, including the inbound IDs and external config IDs it is attached to.
+
+
+
+POST
+/panel/api/clients/add
+Create a new client and attach it to one or more inbounds in a single call. Body is JSON. Per-protocol secrets (UUID for VLESS/VMess, password for Trojan/Shadowsocks, auth for Hysteria) are generated server-side when omitted, so callers can send only the universal fields.
+
+
+
+POST
+/panel/api/clients/update/{email}
+Update an existing client by email. Changes propagate to every attached inbound. Body is the JSON client payload — supply the full set of fields you want to keep (the server replaces the row, it does not patch).
+
+
+
+POST
+/panel/api/clients/del/{email}
+Delete a client by email. Removes it from every attached inbound and drops its traffic record unless keepTraffic=1 is passed.
+
+
+
+POST
+/panel/api/clients/{email}/attach
+Attach an existing client to one or more additional inbounds. Body is JSON.
+
+
+
+POST
+/panel/api/clients/{email}/detach
+Detach a client from one or more inbounds without deleting the client.
+
+
+
+POST
+/panel/api/clients/{email}/externalLinks
+Replace a client's external links (per-client share links and remote subscription URLs surfaced in their subscription). Sends the full set; the server replaces all rows.
+
+
+
+POST
+/panel/api/clients/resetAllTraffics
+Reset the up/down counters for every client globally. Quotas and expiry are not affected. Triggers an Xray restart if any counter actually moved.
+
+
+
+POST
+/panel/api/clients/delDepleted
+Delete every client whose traffic quota is exhausted (used >= total, when reset is disabled) or whose expiry has passed. Returns the deleted count and triggers an Xray restart when any client was on a running inbound.
+
+
+
+POST
+/panel/api/clients/delOrphans
+Delete every client that is not attached to any inbound, along with its traffic record, IP log, and external links. Useful for clearing clients left unattached after their inbounds were removed. Returns the deleted count. Cannot be undone.
+
+
+
+GET
+/panel/api/clients/export
+Return every client as a {client, inboundIds} array — the same shape /bulkCreate and /import accept — so the payload round-trips straight back through /import. Clients with no inbound attachment are included with an empty inboundIds list. The UI shows this in a CodeMirror viewer (copy / download); programmatic callers get the array in obj.
+
+
+
+POST
+/panel/api/clients/import
+Import clients from a JSON body { "data": "<json>" }, where data is a string-encoded array produced by /export ([{client, inboundIds}]). Items with inboundIds are created and attached to those inbounds; items with an empty inboundIds list are restored as unattached client records. Existing emails are never overwritten — they are returned in skipped. Triggers a single Xray restart at the end if any target inbound was running.
+
+
+
+POST
+/panel/api/clients/bulkAdjust
+Shift expiry and/or traffic quota for many clients in one call. addDays/addBytes may be negative. Clients with unlimited expiry (expiryTime=0) or unlimited traffic (totalGB=0) are skipped for the corresponding field — bulk extend never converts unlimited to limited. A client that was auto-disabled solely because it was depleted (expired or over quota) is automatically re-enabled — locally and on its node — when the adjustment lifts it out of depletion; a manually-disabled or still-depleted client is left disabled. The optional flow directive sets the XTLS flow on every client: "none" clears it, "xtls-rprx-vision"/"xtls-rprx-vision-udp443" set it where the inbound supports it (omit or "" to leave it unchanged). Returns the adjusted count and per-email skip reasons.
+
+
+
+POST
+/panel/api/clients/bulkEnable
+Enable many clients in one call. Emails are grouped by inbound and applied with a single read-modify-write per inbound; the running Xray (local or remote node) is updated to add each user. Note that enabling a client whose quota is exhausted or whose expiry has passed only flips the flag — the traffic loop will disable it again on the next tick. Returns the changed count and per-email skip reasons.
+
+
+
+POST
+/panel/api/clients/bulkDisable
+Disable many clients in one call. Emails are grouped by inbound and applied with a single read-modify-write per inbound; the running Xray (local or remote node) is updated to remove each user. Returns the changed count and per-email skip reasons.
+
+
+
+POST
+/panel/api/clients/bulkDel
+Delete many clients in one call. The server processes the list sequentially so each delete sees the committed state of the previous one — avoids the race the per-email fan-out had on the panel side. Pass keepTraffic=true to retain the xray_client_traffic rows after deletion.
+
+
+
+POST
+/panel/api/clients/bulkCreate
+Create many clients in one call. Body is a JSON array of {client, inboundIds} payloads — the same shape /add accepts. Items are processed sequentially; per-email skip reasons are returned for items that fail (e.g., duplicate email). Triggers a single Xray restart at the end if any inbound was running.
+
+
+
+POST
+/panel/api/clients/groups/bulkAdd
+Add many clients to a group in one call. Updates clients.group_name and patches the matching client entry inside every owning inbound's settings JSON in a single transaction. If the group name does not yet exist (in client_groups or as a derived label), it is auto-created as a persistent group. To clear the group label, use /groups/bulkRemove instead.
+
+
+
+POST
+/panel/api/clients/groups/bulkRemove
+Clear the group label on many clients in one call. Inverse of /groups/bulkAdd. Clients themselves are kept — only the group label is cleared from clients.group_name and from each owning inbound's settings JSON. Groups become empty if all their members are removed.
+
+
+
+POST
+/panel/api/clients/bulkAttach
+Attach many existing clients to many inbounds in one call. Each client keeps its identity (email/UUID/password/subId) and a shared traffic row; all clients are added to a target inbound in a single AddInboundClient call. Clients already present on a target are reported under skipped. Returns per-email attached/skipped/errors lists and triggers a single Xray restart if any target inbound was running.
+
+
+
+POST
+/panel/api/clients/bulkDetach
+Mirror of bulkAttach: detach many existing clients from many inbounds in one call. For each email, intersects the client's current inbounds with the requested set and detaches from those only; (email, inbound) pairs where the client is not currently attached are silently no-ops. Emails not attached to any of the requested inbounds are reported under skipped. Client records are kept even if they become orphaned — use bulkDel for full removal. Returns per-email detached/skipped/errors lists and triggers a single Xray restart if any target inbound was running.
+
+
+
+POST
+/panel/api/clients/bulkResetTraffic
+Zero up/down counters for many clients in one call. Loops the single-reset path so each client is re-enabled across its attached inbounds and pushed to Xray/remote nodes. Returns the count of successfully reset clients.
+
+
+
+GET
+/panel/api/clients/groups
+List all client groups with their member counts. Merges persisted groups (rows in client_groups, including empty placeholders) with the distinct group_name values currently set on clients. Sorted alphabetically (case-insensitive).
+
+
+
+GET
+/panel/api/clients/groups/{name}/emails
+Return just the email list of clients that currently belong to the given group. Useful for fanning a single bulk action over an entire group without round-tripping the full client list.
+
+
+
+POST
+/panel/api/clients/groups/create
+Create a new empty (placeholder) group. The group becomes selectable in client forms and the filter drawer even before any client is added to it. Errors if a group with the same name already exists.
+
+
+
+POST
+/panel/api/clients/groups/rename
+Rename a group. The new name is applied to the client_groups row AND propagated to every matching client (both clients.group_name and the client entry inside every owning inbound's settings JSON) in a single transaction. Returns the number of clients whose label was updated.
+
+
+
+POST
+/panel/api/clients/groups/delete
+Remove a group. Deletes the client_groups row and clears the group label from every matching client (both clients.group_name and the inbound settings JSON). The clients themselves are NOT deleted — use /bulkDel after filtering by group for that. Returns the count of clients whose label was cleared.
+
+
+
+POST
+/panel/api/clients/groups/resetTraffic
+Reset only the group-level traffic counter shown on the groups page. Snapshots the current up/down sum of the group's members as a baseline so the group total reads zero, while leaving each client's own counters (and their quotas) untouched. No Xray restart is triggered. Creates the client_groups row if the group exists only as a derived label.
+
+
+
+POST
+/panel/api/clients/resetTraffic/{email}
+Zero out a single client’s up/down counters. Re-enables the client across every attached inbound and pushes the change to Xray (or the remote node) so depleted users can connect again immediately.
+
+
+
+POST
+/panel/api/clients/updateTraffic/{email}
+Manually adjust a client’s upload + download counters. Useful for migrations from external accounting systems.
+
+
+
+POST
+/panel/api/clients/ips/{email}
+List source IPs that have connected with the given client’s credentials. Returns an array of "ip (timestamp)" strings.
+
+
+
+POST
+/panel/api/clients/clearIps/{email}
+Reset the recorded IP list for a client.
+
+
+
+POST
+/panel/api/clients/onlines
+List the emails of currently connected clients (last seen within the heartbeat window), deduped across every node.
+
+
+
+POST
+/panel/api/clients/onlinesByGuid
+Online client emails grouped by the panelGuid of the node that physically hosts each client. The local panel uses its own GUID; each node (at any depth in a chain) uses its GUID. Lets the inbounds page attribute online status to the real node instead of the intermediate one it syncs through.
+
+
+
+POST
+/panel/api/clients/clientIpsByGuid
+Per-client source IPs grouped by the panelGuid of the node that observed them. Lets the central panel attribute and enforce per-client IP limits using the real visitor IPs each node sees, instead of the address of the intermediate panel it syncs through.
+
+
+
+POST
+/panel/api/clients/activeInbounds
+Inbound tags that carried traffic within the heartbeat window, grouped by the hosting node's panelGuid. Pairs with onlinesByGuid so the inbounds page only marks a multi-inbound client online on the inbounds it actually used. Nodes that do not report per-inbound activity are absent.
+
+
+
+POST
+/panel/api/clients/lastOnline
+Map of client email → last-seen unix timestamp.
+
+
+
+GET
+/panel/api/clients/traffic/{email}
+Traffic counters for a client identified by email.
+
+
+
+GET
+/panel/api/clients/subLinks/{subId}
+Return every protocol URL (vless://, vmess://, trojan://, ss://, hysteria://, hy2://) for clients matching the subscription ID. Same result set as /sub/<subId>, but as a JSON array — no base64. When an inbound has streamSettings.externalProxy set, one URL is emitted per external proxy. Empty array when the subId has no enabled clients.
+
+
+
+GET
+/panel/api/clients/links/{email}
+Return every URL for one client across all attached inbounds — the same strings the Copy URL button copies in the panel UI. Supported protocols: vmess, vless, trojan, shadowsocks, hysteria. If streamSettings.externalProxy is set, returns one URL per external proxy. Protocols without a URL form (socks, http, mixed, wireguard, dokodemo, tunnel) contribute nothing.
+
+
+Nodes
+Manage remote 3x-ui panels acting as nodes for a central panel. All endpoints under /panel/api/nodes.
+
+
+
+GET
+/panel/api/nodes/list
+List every configured node with its connection details, health, and last heartbeat patch.
+
+
+
+POST
+/panel/api/nodes/mtls/ca
+This panel's node-auth CA certificate (public, PEM) to paste into a node's mTLS trust setting. Lazily mints the CA and the master client cert on first call. Pair with setting tlsVerifyMode=mtls on the node.
+
+
+
+POST
+/panel/api/nodes/mtls/trustCA
+Set the CA certificate this panel trusts for incoming node-API client certificates (this panel acting as a node). Paste the managing panel's CA (from nodes/mtls/ca). An empty caCert disables it. A non-empty value must be a PEM certificate. Applied on the next panel restart.
+
+
+
+GET
+/panel/api/nodes/get/{id}
+Fetch a single node by ID.
+
+
+
+GET
+/panel/api/nodes/webCert/{id}
+Fetch a node's own web TLS certificate/key file paths (proxied to the node). Used by the inbound form's "Set Cert from Panel" so a node-assigned inbound gets paths that exist on the node, not the central panel.
+
+
+
+POST
+/panel/api/nodes/add
+Register a new remote node. Provide its URL, apiToken, and optional remark / allowPrivateAddress flag.
+
+
+
+POST
+/panel/api/nodes/update/{id}
+Replace a node’s connection details. Same body shape as /add.
+
+
+
+POST
+/panel/api/nodes/del/{id}
+Delete a node. Inbounds bound to it are not auto-migrated.
+
+
+
+POST
+/panel/api/nodes/setEnable/{id}
+Pause or resume traffic sync with this node.
+
+
+
+POST
+/panel/api/nodes/test
+Probe a node without saving it. Uses the body as connection details and returns the same heartbeat snapshot a registered node would have.
+
+
+
+POST
+/panel/api/nodes/certFingerprint
+Connect to the node over HTTPS without verifying its certificate and return the leaf certificate's SHA-256 (base64). Used by the Add/Edit Node dialog to fetch and pin a self-signed certificate. Uses the same body as /test.
+
+
+
+POST
+/panel/api/nodes/inbounds
+Use unsaved node connection details to list the remote inbounds available for selective import.
+
+
+
+POST
+/panel/api/nodes/probe/{id}
+Probe an existing node, updating its cached health state.
+
+
+
+POST
+/panel/api/nodes/updatePanel
+Trigger the official panel self-updater on each given node (downloads the latest release and restarts). Only enabled, online nodes are updated; offline/disabled ones are reported as skipped. Set "dev": true to move the nodes to the rolling per-commit dev channel instead of the latest stable release. Returns a per-node result list.
+
+
+
+GET
+/panel/api/nodes/history/{id}/{metric}/{bucket}
+Aggregated metric history for a node — same shape as /server/history, scoped to one node.
+
+
+Hosts
+Per-inbound override endpoints. Each enabled host renders one extra subscription link/proxy with its own address/port/TLS, superseding the legacy externalProxy array. All endpoints under /panel/api/hosts.
+
+
+
+GET
+/panel/api/hosts/list
+List every host across all inbounds, grouped by inbound then ordered by sort order.
+
+
+
+GET
+/panel/api/hosts/get/{groupId}
+Fetch a single host group by Group ID.
+
+
+
+GET
+/panel/api/hosts/byInbound/{inboundId}
+Fetch one inbound's hosts, grouped by host group.
+
+
+
+GET
+/panel/api/hosts/tags
+Distinct, sorted set of tags used across all hosts.
+
+
+
+POST
+/panel/api/hosts/add
+Create a host group on inbounds.
+
+
+
+POST
+/panel/api/hosts/update/{groupId}
+Replace a host group’s content.
+
+
+
+POST
+/panel/api/hosts/del/{groupId}
+Delete a host group.
+
+
+
+POST
+/panel/api/hosts/setEnable/{groupId}
+Enable or disable a host group.
+
+
+
+POST
+/panel/api/hosts/reorder
+Set host group sort order by the position of each groupId in the array.
+
+
+
+POST
+/panel/api/hosts/bulk/add
+Add a host group to inbounds (same as /add).
+
+
+
+POST
+/panel/api/hosts/bulk/setEnable
+Enable or disable many host groups in one call.
+
+
+
+POST
+/panel/api/hosts/bulk/del
+Delete many host groups in one call.
+
+
+Backup
+Operations that interact with the configured Telegram bot.
+
+
+
+POST
+/panel/api/backuptotgbot
+Send a fresh DB backup to every Telegram chat configured as an admin recipient. No body, no params.
+
+
+Settings
+Panel configuration and user credentials. All endpoints live under /panel/api/setting and require a logged-in session or Bearer token.
+
+
+
+POST
+/panel/api/setting/all
+Return every panel setting: web server, Telegram bot, subscription, security, LDAP. The full JSON blob that the Settings page edits.
+
+
+
+POST
+/panel/api/setting/defaultSettings
+Return the computed default settings based on the request host. Useful to preview what a fresh install would use.
+
+
+
+POST
+/panel/api/setting/update
+Persist every setting at once. The body mirrors the shape returned by /all. Invalid values (bad ports, missing cert pairs, etc.) are rejected before write.
+
+
+
+POST
+/panel/api/setting/updateUser
+Change the panel admin username and password. Requires the current credentials for verification. The session is refreshed with the new values on success.
+
+
+
+POST
+/panel/api/setting/restartPanel
+Restart the entire 3x-ui process after a 3-second grace period. The connection drops immediately; the panel comes back online ~5-10 seconds later.
+
+
+
+POST
+/panel/api/setting/testSmtp
+Test SMTP connection with stage-by-stage reporting (connect, auth, send). Returns structured result with stage and message.
+
+
+
+POST
+/panel/api/setting/testTgBot
+Test Telegram bot connection by sending a test message to the configured chat.
+
+
+
+GET
+/panel/api/setting/getDefaultJsonConfig
+Return the built-in default Xray JSON config template that ships with this panel version.
+
+
+API Tokens
+Manage Bearer tokens used for programmatic auth (bots, central panels acting on this node, CI). Each token has a unique name and an enabled flag — disable to revoke without deleting, delete to revoke permanently. Tokens are stored as SHA-256 hashes and the plaintext is returned only once, in the create response — it cannot be retrieved afterwards, so copy it then. Send one as Authorization: Bearer <token> on any /panel/api/* request — the token is a full-admin credential.
+
+
+
+GET
+/panel/api/setting/apiTokens
+List every API token, enabled or not. The token value is never returned — only metadata.
+
+
+
+POST
+/panel/api/setting/apiTokens/create
+Mint a new API token. Name must be unique and 1-64 characters; the token string is server-generated and returned only in this response — it is stored hashed and cannot be retrieved later.
+
+
+
+POST
+/panel/api/setting/apiTokens/delete/{id}
+Permanently delete a token. Any caller using it stops authenticating immediately.
+
+
+
+POST
+/panel/api/setting/apiTokens/setEnabled/{id}
+Toggle a token enabled/disabled without deleting it. Disabled tokens are rejected by checkAPIAuth on the next request.
+
+
+Xray Settings
+Xray configuration template, outbound management, Warp/Nord integration, and config testing. All endpoints under /panel/api/xray.
+
+
+
+POST
+/panel/api/xray/
+Return the Xray config template (JSON string), available inbound tags, client reverse tags, and the configured outbound test URL in one response.
+
+
+
+GET
+/panel/api/xray/getDefaultJsonConfig
+Return the built-in default Xray config shipped with the panel (identical to /panel/api/setting/getDefaultJsonConfig).
+
+
+
+GET
+/panel/api/xray/getOutboundsTraffic
+Return traffic statistics for every outbound. Each outbound shows up/down/total counters.
+
+
+
+GET
+/panel/api/xray/getXrayResult
+Return the most recent Xray process stdout/stderr output. Useful to check for startup errors or runtime warnings.
+
+
+
+POST
+/panel/api/xray/update
+Save the Xray JSON config template and optionally the outbound test URL. Both are sent as form fields.
+
+
+
+POST
+/panel/api/xray/warp/{action}
+Manage Cloudflare Warp integration. The action parameter selects the operation.
+
+
+
+POST
+/panel/api/xray/nord/{action}
+Manage NordVPN integration. The action parameter selects the operation.
+
+
+
+POST
+/panel/api/xray/resetOutboundsTraffic
+Reset traffic counters for a specific outbound by tag.
+
+
+
+POST
+/panel/api/xray/testOutbound
+Test an outbound configuration. Sends the outbound JSON (required), optionally all outbounds (to resolve sockopt.dialerProxy dependencies), and a mode flag.
+
+
+
+POST
+/panel/api/xray/testOutbounds
+Test a batch of outbounds (max 50) through one shared temp xray instance. Returns an array of results in input order, each with the outbound tag, delay, HTTP status and a connect/TLS/TTFB timing breakdown.
+
+
+
+POST
+/panel/api/xray/balancerStatus
+Live state of routing balancers in the running core (RoutingService.GetBalancerInfo): current override and the targets the strategy prefers. Returns a map keyed by balancer tag.
+
+
+
+POST
+/panel/api/xray/balancerOverride
+Force a balancer in the running core to always pick one outbound (RoutingService.OverrideBalancerTarget). Applied live without a restart; cleared automatically when Xray restarts.
+
+
+
+POST
+/panel/api/xray/routeTest
+Ask the running core which outbound its router would pick for a synthetic connection (RoutingService.TestRoute). No traffic is sent.
+
+
+
+GET
+/panel/api/xray/outbound-subs
+List all outbound subscriptions (remote URLs that supply additional outbounds), newest first.
+
+
+
+POST
+/panel/api/xray/outbound-subs
+Create an outbound subscription. The URL is fetched, parsed into outbounds with stable tags, and merged additively into the running Xray config.
+
+
+
+POST
+/panel/api/xray/outbound-subs/{id}
+Update an existing outbound subscription by id. Accepts the same form fields as create.
+
+
+
+DELETE
+/panel/api/xray/outbound-subs/{id}
+Delete an outbound subscription by id.
+
+
+
+POST
+/panel/api/xray/outbound-subs/{id}/del
+Delete an outbound subscription by id (POST alias of DELETE for clients that cannot send DELETE).
+
+
+
+POST
+/panel/api/xray/outbound-subs/{id}/refresh
+Force an immediate re-fetch of the subscription and return the parsed outbounds. Signals Xray to reload.
+
+
+
+POST
+/panel/api/xray/outbound-subs/{id}/move
+Reorder a subscription one step up or down in priority (controls its position in the merged outbounds).
+
+
+
+POST
+/panel/api/xray/outbound-subs/parse
+Preview a subscription URL: fetch and parse it into outbounds without persisting anything.
+
+
+Subscription Server
+A separate HTTP/HTTPS server that serves proxy subscription links (standard, JSON, and Clash) to clients. The server listens on its own port (default 10882) and is configured in Settings → Subscription. Paths are configurable; defaults are shown below. All subscription endpoints set response headers for client apps to read traffic/expiry info.
+
+
+
+GET
+/{subPath}{subid}
+Return base64-encoded subscription links for all enabled clients matching the subscription ID. When the request has an Accept: text/html header or ?html=1, renders a styled info page instead. Default path: /sub/:subid.
+
+
+
+GET
+/{jsonPath}{subid}
+Return subscription as a JSON array of proxy configs (one per enabled client). Only when JSON subscription is enabled in settings. Default path: /json/:subid.
+
+
+
+GET
+/{clashPath}{subid}
+Return subscription as a Clash/Mihomo-compatible YAML config, including configured global Clash routing rules. Only when Clash subscription is enabled in settings. Default path: /clash/:subid.
+
+
+WebSocket
+Real-time status updates via WebSocket. Connect once at ws:///ws to receive a stream of JSON messages without polling. Requires an authenticated session cookie (Bearer token auth is not supported). Each message has a type field that identifies the payload shape.
+
+
+
+GET
+/ws
+Upgrade an HTTP connection to a WebSocket. Requires an authenticated session cookie (Bearer token auth is not supported here). Returns 101 Switching Protocols on success. The server then pushes JSON messages described below.
+
+
+
+Schemas

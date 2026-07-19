@@ -1,3 +1,4 @@
+import contextlib
 import sqlite3
 from typing import List, Optional, Tuple
 
@@ -6,13 +7,49 @@ import jdatetime
 from config import DB_PATH
 
 
+@contextlib.contextmanager
+def _connect():
+    """
+    نکته‌ی فنی مهم: ``with _connect() as conn:`` که در نسخه‌ی
+    قبلی همه‌جا استفاده شده بود، connection را می‌بندد؟ نه — طبق مستندات
+    خودِ ماژول sqlite3، این context manager فقط تراکنش را commit/rollback
+    می‌کند، نه چیزی بیشتر. یعنی خودِ اتصال (و فایل‌هندل زیرینش) هیچ‌وقت با
+    آن الگو بسته نمی‌شد و روی برنامه‌ی طولانی‌مدت مثل یک ربات تلگرام،
+    به‌مرور فایل‌هندل/اتصال باز تلنبار می‌شود.
+
+    این تابع همان رفتار قبلی (commit خودکار در پایان بلوک، rollback در صورت
+    استثنا) را حفظ می‌کند، به‌علاوه‌ی conn.close() واقعی در finally.
+    """
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
 def _column_exists(conn: sqlite3.Connection, table: str, column: str) -> bool:
     cur = conn.execute(f"PRAGMA table_info({table})")
     return any(row[1] == column for row in cur.fetchall())
 
 
+def _row_to_dict(cursor: sqlite3.Cursor, row: Optional[tuple]) -> Optional[dict]:
+    """
+    یک ردیف sqlite3 را با استفاده از cursor.description به دیکشنری تبدیل
+    می‌کند. این یک تابع مشترک است تا الگوی ``dict(zip([c[0] for c in
+    cursor.description], row))`` در همه‌جا تکرار (و مستعد اشتباه) نشود؛
+    همیشه بر اساس نام واقعی ستون‌ها کار می‌کند، نه اندیس فرضی.
+    """
+    if row is None:
+        return None
+    return dict(zip([col[0] for col in cursor.description], row))
+
+
 def init_db() -> None:
-    with sqlite3.connect(DB_PATH) as conn:
+    with _connect() as conn:
         c = conn.cursor()
         c.execute(
             """
@@ -74,42 +111,35 @@ def init_db() -> None:
             """
         )
 
-        # مهاجرت برای دیتابیس‌های قدیمی‌تر که ستون xui_email را ندارند
-        # (این ستون کش ایمیل کلاینت x-ui است تا لازم نباشه هر بار همه‌ی
-        # inbound ها را برای پیدا کردن subId اسکن کنیم)
-        if not _column_exists(conn, "user_services", "xui_email"):
-            c.execute("ALTER TABLE user_services ADD COLUMN xui_email TEXT")
-
         # -------------------------------------------------------------
-        # مهاجرت‌های جدید (تست خودکار / مانیتورینگ / تیکت / آمار / Referral)
-        # فقط افزودن ستون/جدول در صورت نبود؛ هیچ داده‌ی قبلی حذف/تغییر نمی‌شود.
+        # سیستم Migration ساده و ساختاریافته
         # -------------------------------------------------------------
-
-        # user_services: نوع ماشین‌خوان سرویس + اطلاعات کلاینت زنده‌ی x-ui
-        if not _column_exists(conn, "user_services", "kind"):
-            c.execute("ALTER TABLE user_services ADD COLUMN kind TEXT DEFAULT 'paid'")
-        if not _column_exists(conn, "user_services", "xui_client_uuid"):
-            c.execute("ALTER TABLE user_services ADD COLUMN xui_client_uuid TEXT")
-        if not _column_exists(conn, "user_services", "xui_inbound_id"):
-            c.execute("ALTER TABLE user_services ADD COLUMN xui_inbound_id INTEGER")
-        if not _column_exists(conn, "user_services", "total_bytes"):
-            c.execute("ALTER TABLE user_services ADD COLUMN total_bytes INTEGER DEFAULT 0")
-        if not _column_exists(conn, "user_services", "expiry_ms"):
-            c.execute("ALTER TABLE user_services ADD COLUMN expiry_ms INTEGER DEFAULT 0")
-        if not _column_exists(conn, "user_services", "protocol"):
-            c.execute("ALTER TABLE user_services ADD COLUMN protocol TEXT")
-
-        # users: سیستم Referral (بخش ۶)
-        if not _column_exists(conn, "users", "invited_by"):
-            c.execute("ALTER TABLE users ADD COLUMN invited_by INTEGER")
-        if not _column_exists(conn, "users", "invite_count"):
-            c.execute("ALTER TABLE users ADD COLUMN invite_count INTEGER DEFAULT 0")
-        if not _column_exists(conn, "users", "referral_rewards_given"):
-            c.execute("ALTER TABLE users ADD COLUMN referral_rewards_given INTEGER DEFAULT 0")
-
-        # orders: نوع سفارش (برای گزارش فروش بخش ۴؛ پیش‌فرض 'purchase' سازگار با داده‌ی قبلی)
-        if not _column_exists(conn, "orders", "kind"):
-            c.execute("ALTER TABLE orders ADD COLUMN kind TEXT DEFAULT 'purchase'")
+        # به‌جای تکرار «if not _column_exists(...): ALTER TABLE ...» برای هر
+        # ستون (که خطای کپی/پیست و فراموشی را آسان می‌کرد)، همه‌ی مهاجرت‌های
+        # ستونی این پروژه در یک لیست اعلانی (declarative) جمع شده‌اند و با
+        # یک حلقه‌ی واحد اعمال می‌شوند. هر ورودی idempotent است (اگر ستون از
+        # قبل باشد، رد می‌شود)، پس اجرای مکرر init_db() کاملاً بی‌خطر است و
+        # هیچ داده‌ی موجودی حذف/بازسازی نمی‌شود.
+        #
+        # برای افزودن یک migration جدید در آینده، کافی است یک سطر
+        # (table, column, ddl_suffix) به COLUMN_MIGRATIONS اضافه شود.
+        COLUMN_MIGRATIONS: List[Tuple[str, str, str]] = [
+            # (table, column, "ALTER TABLE ... ADD COLUMN" کامل)
+            ("user_services", "xui_email", "ALTER TABLE user_services ADD COLUMN xui_email TEXT"),
+            ("user_services", "kind", "ALTER TABLE user_services ADD COLUMN kind TEXT DEFAULT 'paid'"),
+            ("user_services", "xui_client_uuid", "ALTER TABLE user_services ADD COLUMN xui_client_uuid TEXT"),
+            ("user_services", "xui_inbound_id", "ALTER TABLE user_services ADD COLUMN xui_inbound_id INTEGER"),
+            ("user_services", "total_bytes", "ALTER TABLE user_services ADD COLUMN total_bytes INTEGER DEFAULT 0"),
+            ("user_services", "expiry_ms", "ALTER TABLE user_services ADD COLUMN expiry_ms INTEGER DEFAULT 0"),
+            ("user_services", "protocol", "ALTER TABLE user_services ADD COLUMN protocol TEXT"),
+            ("users", "invited_by", "ALTER TABLE users ADD COLUMN invited_by INTEGER"),
+            ("users", "invite_count", "ALTER TABLE users ADD COLUMN invite_count INTEGER DEFAULT 0"),
+            ("users", "referral_rewards_given", "ALTER TABLE users ADD COLUMN referral_rewards_given INTEGER DEFAULT 0"),
+            ("orders", "kind", "ALTER TABLE orders ADD COLUMN kind TEXT DEFAULT 'purchase'"),
+        ]
+        for table, column, ddl in COLUMN_MIGRATIONS:
+            if not _column_exists(conn, table, column):
+                c.execute(ddl)
 
         # سیستم تیکت پشتیبانی (بخش ۳)
         c.execute(
@@ -199,8 +229,15 @@ def get_or_create_user(
     inviter_id با خودِ user_id یکی نباشد، یعنی کسی نمی‌تواند خودش را دعوت
     کند)، ستون invited_by ثبت می‌شود — پایه‌ی سیستم Referral در بخش ۶.
     ثبت شمارش/پاداش دعوت‌کننده در جای دیگری (record_referral) انجام می‌شود.
+
+    نکته‌ی پایداری: اگر همین کاربر دقیقاً هم‌زمان از دو Update تلگرام
+    (مثلاً دو پیام سریع پشت‌سرهم) با هم به این تابع برسد، هر دو ممکن است
+    ردیف را «موجود نیست» ببینند و هر دو تلاش کنند INSERT کنند. قبلاً این
+    حالت باعث کرش با sqlite3.IntegrityError روی PRIMARY KEY می‌شد؛ حالا این
+    حالت گرفته می‌شود و به‌جای کرش، همان رفتار «کاربر از قبل وجود دارد» را
+    برمی‌گرداند.
     """
-    with sqlite3.connect(DB_PATH) as conn:
+    with _connect() as conn:
         c = conn.cursor()
         c.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
         row = c.fetchone()
@@ -213,7 +250,7 @@ def get_or_create_user(
             conn.commit()
             c.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
             updated_row = c.fetchone()
-            result = dict(zip([column[0] for column in c.description], updated_row))
+            result = _row_to_dict(c, updated_row)
             result["_is_new"] = False
             return result
 
@@ -224,24 +261,36 @@ def get_or_create_user(
 
         valid_inviter = inviter_id if (inviter_id and inviter_id != user_id) else None
 
-        c.execute(
-            "INSERT INTO users (user_id, username, full_name, balance, referral_code, join_date, invited_by) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (user_id, username, full_name, 0, ref_code, now, valid_inviter),
-        )
-        conn.commit()
+        try:
+            c.execute(
+                "INSERT INTO users (user_id, username, full_name, balance, referral_code, join_date, invited_by) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (user_id, username, full_name, 0, ref_code, now, valid_inviter),
+            )
+            conn.commit()
+            is_new = True
+        except sqlite3.IntegrityError:
+            # ریس‌کاندیشن: یک درخواست هم‌زمان دیگر همین کاربر را زودتر ساخته.
+            # به‌جای کرش، همان مسیر «کاربر از قبل موجود است» را دنبال می‌کنیم.
+            conn.rollback()
+            c.execute(
+                "UPDATE users SET username = ?, full_name = ? WHERE user_id = ?",
+                (username, full_name, user_id),
+            )
+            conn.commit()
+            is_new = False
 
         c.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
-        new_row = c.fetchone()
-        result = dict(zip([column[0] for column in c.description], new_row))
-        result["_is_new"] = True
+        final_row = c.fetchone()
+        result = _row_to_dict(c, final_row)
+        result["_is_new"] = is_new
         return result
 
 
 def get_user_by_referral_code(code: str) -> Optional[dict]:
     if not code:
         return None
-    with sqlite3.connect(DB_PATH) as conn:
+    with _connect() as conn:
         c = conn.cursor()
         c.execute("SELECT * FROM users WHERE referral_code = ?", (code.strip(),))
         row = c.fetchone()
@@ -251,7 +300,7 @@ def get_user_by_referral_code(code: str) -> Optional[dict]:
 
 
 def get_user_by_id(user_id: int) -> Optional[dict]:
-    with sqlite3.connect(DB_PATH) as conn:
+    with _connect() as conn:
         c = conn.cursor()
         c.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
         row = c.fetchone()
@@ -261,7 +310,7 @@ def get_user_by_id(user_id: int) -> Optional[dict]:
 
 
 def get_user_balance(user_id: int) -> int:
-    with sqlite3.connect(DB_PATH) as conn:
+    with _connect() as conn:
         c = conn.cursor()
         c.execute("SELECT balance FROM users WHERE user_id = ?", (user_id,))
         res = c.fetchone()
@@ -269,7 +318,7 @@ def get_user_balance(user_id: int) -> int:
 
 
 def has_used_test_account(user_id: int) -> bool:
-    with sqlite3.connect(DB_PATH) as conn:
+    with _connect() as conn:
         c = conn.cursor()
         c.execute("SELECT test_account_used FROM users WHERE user_id = ?", (user_id,))
         res = c.fetchone()
@@ -277,14 +326,14 @@ def has_used_test_account(user_id: int) -> bool:
 
 
 def mark_test_account_used(user_id: int) -> None:
-    with sqlite3.connect(DB_PATH) as conn:
+    with _connect() as conn:
         c = conn.cursor()
         c.execute("UPDATE users SET test_account_used = 1 WHERE user_id = ?", (user_id,))
         conn.commit()
 
 
 def get_available_config(product_key: str) -> Optional[dict]:
-    with sqlite3.connect(DB_PATH) as conn:
+    with _connect() as conn:
         c = conn.cursor()
         c.execute(
             "SELECT * FROM configs WHERE product_key = ? AND status = 'available' LIMIT 1",
@@ -297,7 +346,7 @@ def get_available_config(product_key: str) -> Optional[dict]:
 
 
 def assign_config_to_order(order_id: int, config_id: int) -> None:
-    with sqlite3.connect(DB_PATH) as conn:
+    with _connect() as conn:
         c = conn.cursor()
         c.execute("UPDATE configs SET status = 'sold' WHERE id = ?", (config_id,))
         c.execute(
@@ -309,7 +358,7 @@ def assign_config_to_order(order_id: int, config_id: int) -> None:
 
 def create_order(user_id: int, product_key: str, price: int) -> int:
     now = jdatetime.datetime.now().strftime("%Y/%m/%d %H:%M:%S")
-    with sqlite3.connect(DB_PATH) as conn:
+    with _connect() as conn:
         c = conn.cursor()
         c.execute(
             "INSERT INTO orders (user_id, product_key, price, order_date) VALUES (?, ?, ?, ?)",
@@ -320,7 +369,7 @@ def create_order(user_id: int, product_key: str, price: int) -> int:
 
 
 def get_user_orders(user_id: int) -> List[dict]:
-    with sqlite3.connect(DB_PATH) as conn:
+    with _connect() as conn:
         c = conn.cursor()
         c.execute(
             """
@@ -340,7 +389,7 @@ def get_user_orders(user_id: int) -> List[dict]:
 # ---------------------------------------------------------------------------
 
 def add_config(product_key: str, link: str) -> int:
-    with sqlite3.connect(DB_PATH) as conn:
+    with _connect() as conn:
         c = conn.cursor()
         c.execute(
             "INSERT INTO configs (product_key, link, status) VALUES (?, ?, 'available')",
@@ -356,7 +405,7 @@ def add_configs_batch(entries: List[Tuple[str, str]]) -> List[dict]:
         return []
 
     results = []
-    with sqlite3.connect(DB_PATH) as conn:
+    with _connect() as conn:
         c = conn.cursor()
         for product_key, link in entries:
             c.execute(
@@ -369,7 +418,7 @@ def add_configs_batch(entries: List[Tuple[str, str]]) -> List[dict]:
 
 
 def count_available_configs(product_key: str) -> int:
-    with sqlite3.connect(DB_PATH) as conn:
+    with _connect() as conn:
         c = conn.cursor()
         c.execute(
             "SELECT COUNT(*) FROM configs WHERE product_key = ? AND status = 'available'",
@@ -379,7 +428,7 @@ def count_available_configs(product_key: str) -> int:
 
 
 def get_stock_summary() -> List[dict]:
-    with sqlite3.connect(DB_PATH) as conn:
+    with _connect() as conn:
         c = conn.cursor()
         c.execute(
             "SELECT product_key, COUNT(*) FROM configs WHERE status = 'available' GROUP BY product_key"
@@ -388,7 +437,7 @@ def get_stock_summary() -> List[dict]:
 
 
 def delete_config(config_id: int) -> bool:
-    with sqlite3.connect(DB_PATH) as conn:
+    with _connect() as conn:
         c = conn.cursor()
         c.execute("DELETE FROM configs WHERE id = ? AND status = 'available'", (config_id,))
         conn.commit()
@@ -397,7 +446,7 @@ def delete_config(config_id: int) -> bool:
 
 def delete_configs_by_product(product_key: str) -> int:
     """تمام لینک‌های available یک محصول را حذف می‌کند."""
-    with sqlite3.connect(DB_PATH) as conn:
+    with _connect() as conn:
         c = conn.cursor()
         c.execute(
             "DELETE FROM configs WHERE product_key = ? AND status = 'available'",
@@ -408,7 +457,7 @@ def delete_configs_by_product(product_key: str) -> int:
 
 
 def get_config_by_id(config_id: int) -> Optional[dict]:
-    with sqlite3.connect(DB_PATH) as conn:
+    with _connect() as conn:
         c = conn.cursor()
         c.execute("SELECT id, product_key, link, status FROM configs WHERE id = ?", (config_id,))
         row = c.fetchone()
@@ -418,7 +467,7 @@ def get_config_by_id(config_id: int) -> Optional[dict]:
 
 
 def get_configs_by_product(product_key: str, limit: int = 30, offset: int = 0) -> List[dict]:
-    with sqlite3.connect(DB_PATH) as conn:
+    with _connect() as conn:
         c = conn.cursor()
         c.execute(
             "SELECT id, link FROM configs WHERE product_key = ? AND status = 'available' "
@@ -433,7 +482,7 @@ def get_configs_by_product(product_key: str, limit: int = 30, offset: int = 0) -
 # ---------------------------------------------------------------------------
 
 def get_order_by_id(order_id: int) -> Optional[dict]:
-    with sqlite3.connect(DB_PATH) as conn:
+    with _connect() as conn:
         c = conn.cursor()
         c.execute(
             "SELECT id, user_id, product_key, price, status, assigned_config_id, order_date FROM orders WHERE id = ?",
@@ -454,21 +503,21 @@ def get_order_by_id(order_id: int) -> Optional[dict]:
 
 
 def update_order_status(order_id: int, status: str) -> None:
-    with sqlite3.connect(DB_PATH) as conn:
+    with _connect() as conn:
         c = conn.cursor()
         c.execute("UPDATE orders SET status = ? WHERE id = ?", (status, order_id))
         conn.commit()
 
 
 def add_user_balance(user_id: int, amount: int) -> None:
-    with sqlite3.connect(DB_PATH) as conn:
+    with _connect() as conn:
         c = conn.cursor()
         c.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (amount, user_id))
         conn.commit()
 
 
 def mark_config_sold(config_id: int) -> None:
-    with sqlite3.connect(DB_PATH) as conn:
+    with _connect() as conn:
         c = conn.cursor()
         c.execute("UPDATE configs SET status = 'sold' WHERE id = ?", (config_id,))
         conn.commit()
@@ -509,7 +558,7 @@ def create_user_service(
 
     resolved_kind = kind or ("test" if service_type == "test" else "paid")
 
-    with sqlite3.connect(DB_PATH) as conn:
+    with _connect() as conn:
         c = conn.cursor()
         c.execute(
             """
@@ -545,7 +594,7 @@ def create_user_service(
 
 
 def get_user_services_list(limit: int = 10, offset: int = 0) -> List[dict]:
-    with sqlite3.connect(DB_PATH) as conn:
+    with _connect() as conn:
         c = conn.cursor()
         c.execute(
             """
@@ -564,14 +613,14 @@ def get_user_services_list(limit: int = 10, offset: int = 0) -> List[dict]:
 
 
 def count_active_user_services() -> int:
-    with sqlite3.connect(DB_PATH) as conn:
+    with _connect() as conn:
         c = conn.cursor()
         c.execute("SELECT COUNT(*) FROM user_services WHERE status = 'active'")
         return c.fetchone()[0]
 
 
 def get_all_user_ids() -> List[int]:
-    with sqlite3.connect(DB_PATH) as conn:
+    with _connect() as conn:
         c = conn.cursor()
         c.execute("SELECT user_id FROM users")
         return [row[0] for row in c.fetchall()]
@@ -582,7 +631,7 @@ def get_all_user_ids() -> List[int]:
 # ---------------------------------------------------------------------------
 
 def get_services_by_user(user_id: int) -> List[dict]:
-    with sqlite3.connect(DB_PATH) as conn:
+    with _connect() as conn:
         c = conn.cursor()
         c.execute(
             """
@@ -600,7 +649,7 @@ def get_services_by_user(user_id: int) -> List[dict]:
 
 
 def get_user_service_by_id(service_id: int) -> Optional[dict]:
-    with sqlite3.connect(DB_PATH) as conn:
+    with _connect() as conn:
         c = conn.cursor()
         c.execute(
             """
@@ -624,21 +673,21 @@ def set_service_xui_email(service_id: int, email: str) -> None:
     ایمیل کلاینت x-ui را برای یک سرویس کش می‌کند تا دفعات بعد لازم نباشد
     دوباره کل inbound ها برای پیدا کردن subId اسکن شوند.
     """
-    with sqlite3.connect(DB_PATH) as conn:
+    with _connect() as conn:
         c = conn.cursor()
         c.execute("UPDATE user_services SET xui_email = ? WHERE id = ?", (email, service_id))
         conn.commit()
 
 
 def update_service_status(service_id: int, status: str) -> None:
-    with sqlite3.connect(DB_PATH) as conn:
+    with _connect() as conn:
         c = conn.cursor()
         c.execute("UPDATE user_services SET status = ? WHERE id = ?", (status, service_id))
         conn.commit()
 
 
 def update_service_expiry(service_id: int, expiry_date: str, expiry_ms: int) -> None:
-    with sqlite3.connect(DB_PATH) as conn:
+    with _connect() as conn:
         c = conn.cursor()
         c.execute(
             "UPDATE user_services SET expiry_date = ?, expiry_ms = ? WHERE id = ?",
@@ -652,7 +701,7 @@ def update_service_expiry(service_id: int, expiry_date: str, expiry_ms: int) -> 
 # ---------------------------------------------------------------------------
 
 def get_test_services_page(limit: int = 8, offset: int = 0) -> List[dict]:
-    with sqlite3.connect(DB_PATH) as conn:
+    with _connect() as conn:
         c = conn.cursor()
         c.execute(
             """
@@ -671,7 +720,7 @@ def get_test_services_page(limit: int = 8, offset: int = 0) -> List[dict]:
 
 
 def count_test_services() -> int:
-    with sqlite3.connect(DB_PATH) as conn:
+    with _connect() as conn:
         c = conn.cursor()
         c.execute("SELECT COUNT(*) FROM user_services WHERE kind = 'test'")
         return c.fetchone()[0]
@@ -679,7 +728,7 @@ def count_test_services() -> int:
 
 def count_expired_services() -> int:
     now_str = jdatetime.datetime.now().strftime("%Y/%m/%d %H:%M:%S")
-    with sqlite3.connect(DB_PATH) as conn:
+    with _connect() as conn:
         c = conn.cursor()
         c.execute(
             "SELECT COUNT(*) FROM user_services WHERE status = 'active' AND expiry_date < ?",
@@ -701,7 +750,7 @@ def record_referral(inviter_id: int, invited_id: int) -> bool:
     تضمین می‌کند.
     """
     now = jdatetime.datetime.now().strftime("%Y/%m/%d %H:%M:%S")
-    with sqlite3.connect(DB_PATH) as conn:
+    with _connect() as conn:
         c = conn.cursor()
         try:
             c.execute(
@@ -716,7 +765,7 @@ def record_referral(inviter_id: int, invited_id: int) -> bool:
 
 
 def get_invite_count(user_id: int) -> int:
-    with sqlite3.connect(DB_PATH) as conn:
+    with _connect() as conn:
         c = conn.cursor()
         c.execute("SELECT invite_count FROM users WHERE user_id = ?", (user_id,))
         row = c.fetchone()
@@ -724,7 +773,7 @@ def get_invite_count(user_id: int) -> int:
 
 
 def get_referral_rewards_given(user_id: int) -> int:
-    with sqlite3.connect(DB_PATH) as conn:
+    with _connect() as conn:
         c = conn.cursor()
         c.execute("SELECT referral_rewards_given FROM users WHERE user_id = ?", (user_id,))
         row = c.fetchone()
@@ -732,7 +781,7 @@ def get_referral_rewards_given(user_id: int) -> int:
 
 
 def increment_referral_rewards_given(user_id: int) -> None:
-    with sqlite3.connect(DB_PATH) as conn:
+    with _connect() as conn:
         c = conn.cursor()
         c.execute(
             "UPDATE users SET referral_rewards_given = referral_rewards_given + 1 WHERE user_id = ?",
@@ -743,7 +792,7 @@ def increment_referral_rewards_given(user_id: int) -> None:
 
 def add_reward_log(user_id: int, reward_type: str, service_id: Optional[int] = None) -> int:
     now = jdatetime.datetime.now().strftime("%Y/%m/%d %H:%M:%S")
-    with sqlite3.connect(DB_PATH) as conn:
+    with _connect() as conn:
         c = conn.cursor()
         c.execute(
             "INSERT INTO rewards (user_id, reward_type, service_id, created_at) VALUES (?, ?, ?, ?)",
@@ -755,7 +804,7 @@ def add_reward_log(user_id: int, reward_type: str, service_id: Optional[int] = N
 
 def get_referral_stats(limit: int = 10, offset: int = 0) -> List[dict]:
     """لیست کاربرانی که حداقل یک دعوت موفق دارند، برای نمایش در پنل ادمین."""
-    with sqlite3.connect(DB_PATH) as conn:
+    with _connect() as conn:
         c = conn.cursor()
         c.execute(
             """
@@ -772,7 +821,7 @@ def get_referral_stats(limit: int = 10, offset: int = 0) -> List[dict]:
 
 
 def count_users_with_invites() -> int:
-    with sqlite3.connect(DB_PATH) as conn:
+    with _connect() as conn:
         c = conn.cursor()
         c.execute("SELECT COUNT(*) FROM users WHERE invite_count > 0")
         return c.fetchone()[0]
@@ -784,7 +833,7 @@ def count_users_with_invites() -> int:
 
 def create_ticket(user_id: int, username: Optional[str], message: str) -> int:
     now = jdatetime.datetime.now().strftime("%Y/%m/%d %H:%M:%S")
-    with sqlite3.connect(DB_PATH) as conn:
+    with _connect() as conn:
         c = conn.cursor()
         c.execute(
             "INSERT INTO tickets (user_id, username, message, status, created_at, updated_at) "
@@ -796,7 +845,7 @@ def create_ticket(user_id: int, username: Optional[str], message: str) -> int:
 
 
 def get_ticket(ticket_id: int) -> Optional[dict]:
-    with sqlite3.connect(DB_PATH) as conn:
+    with _connect() as conn:
         c = conn.cursor()
         c.execute("SELECT * FROM tickets WHERE id = ?", (ticket_id,))
         row = c.fetchone()
@@ -807,7 +856,7 @@ def get_ticket(ticket_id: int) -> Optional[dict]:
 
 
 def list_tickets(status: Optional[str] = None, limit: int = 8, offset: int = 0) -> List[dict]:
-    with sqlite3.connect(DB_PATH) as conn:
+    with _connect() as conn:
         c = conn.cursor()
         if status:
             c.execute(
@@ -821,7 +870,7 @@ def list_tickets(status: Optional[str] = None, limit: int = 8, offset: int = 0) 
 
 
 def count_tickets(status: Optional[str] = None) -> int:
-    with sqlite3.connect(DB_PATH) as conn:
+    with _connect() as conn:
         c = conn.cursor()
         if status:
             c.execute("SELECT COUNT(*) FROM tickets WHERE status = ?", (status,))
@@ -832,7 +881,7 @@ def count_tickets(status: Optional[str] = None) -> int:
 
 def set_ticket_reply(ticket_id: int, reply_text: str) -> None:
     now = jdatetime.datetime.now().strftime("%Y/%m/%d %H:%M:%S")
-    with sqlite3.connect(DB_PATH) as conn:
+    with _connect() as conn:
         c = conn.cursor()
         c.execute(
             "UPDATE tickets SET admin_reply = ?, status = 'answered', updated_at = ? WHERE id = ?",
@@ -843,7 +892,7 @@ def set_ticket_reply(ticket_id: int, reply_text: str) -> None:
 
 def close_ticket(ticket_id: int) -> None:
     now = jdatetime.datetime.now().strftime("%Y/%m/%d %H:%M:%S")
-    with sqlite3.connect(DB_PATH) as conn:
+    with _connect() as conn:
         c = conn.cursor()
         c.execute(
             "UPDATE tickets SET status = 'closed', updated_at = ? WHERE id = ?",
@@ -858,7 +907,7 @@ def close_ticket(ticket_id: int) -> None:
 
 def log_server_stats(cpu_percent: float, ram_percent: float, disk_percent: float, uptime_seconds: int) -> None:
     now = jdatetime.datetime.now().strftime("%Y/%m/%d %H:%M:%S")
-    with sqlite3.connect(DB_PATH) as conn:
+    with _connect() as conn:
         c = conn.cursor()
         c.execute(
             "INSERT INTO server_stats (cpu_percent, ram_percent, disk_percent, uptime_seconds, created_at) "
@@ -874,7 +923,7 @@ def log_server_stats(cpu_percent: float, ram_percent: float, disk_percent: float
 
 def log_notification(notif_type: str, payload: str = "") -> None:
     now = jdatetime.datetime.now().strftime("%Y/%m/%d %H:%M:%S")
-    with sqlite3.connect(DB_PATH) as conn:
+    with _connect() as conn:
         c = conn.cursor()
         c.execute(
             "INSERT INTO notifications (type, payload, created_at) VALUES (?, ?, ?)",
@@ -897,7 +946,7 @@ def _this_month_jalali_prefix() -> str:
 
 def get_daily_sales_report() -> dict:
     today = _today_jalali_prefix()
-    with sqlite3.connect(DB_PATH) as conn:
+    with _connect() as conn:
         c = conn.cursor()
 
         c.execute(
@@ -945,7 +994,7 @@ def get_daily_sales_report() -> dict:
 
 def get_monthly_sales_report() -> dict:
     month_prefix = _this_month_jalali_prefix()
-    with sqlite3.connect(DB_PATH) as conn:
+    with _connect() as conn:
         c = conn.cursor()
 
         c.execute(

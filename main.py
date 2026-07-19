@@ -1,3 +1,13 @@
+try:
+    # اگر python-dotenv نصب باشد، متغیرهای فایل .env را قبل از import شدن
+    # config.py در os.environ می‌ریزد. کاملاً اختیاری است: اگر نصب نباشد یا
+    # فایل .env نباشد (مثلاً چون متغیرها از طریق systemd EnvironmentFile
+    # ست شده‌اند)، بی‌سروصدا رد می‌شود و رفتار قبلی حفظ می‌شود.
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
