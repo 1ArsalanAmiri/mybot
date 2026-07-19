@@ -1,4 +1,12 @@
 import os
+import sys
+from pathlib import Path
+from dotenv import load_dotenv
+
+# لود کردن فایل .env از مسیری که فایل main.py در آن قرار دارد
+# این دستور به صورت صریح می‌گوید: "فایل .env را دقیقاً کنار main.py پیدا کن"
+dotenv_path = Path(__file__).resolve().parent / '.env'
+load_dotenv(dotenv_path=dotenv_path)
 
 # ---------------------------------------------------------------------------
 # توکن ربات — قبلاً هاردکد بود؛ حالا فقط از Environment Variable خوانده می‌شود.
